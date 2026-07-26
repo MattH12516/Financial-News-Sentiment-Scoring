@@ -1,4 +1,4 @@
-# SentiFeed ⚡
+# SentiFeed
 
 A real-time financial news sentiment analysis platform that aggregates institutional news, retail social sentiment, SEC filings, and unusual trading volume data to surface early market signals.
 
