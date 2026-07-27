@@ -298,10 +298,10 @@ with hcol3:
     run_pipeline = st.button("Run pipeline now", use_container_width=True)
 
 if run_pipeline:
-    with st.spinner("Fetching new articles -- ~10-30s..."):
+    with st.spinner("Fetching new articles -- this can take 1-10 minutes depending on how much new content there is since the last run..."):
         result = subprocess.run(
             [sys.executable, "pipeline.py"],
-            capture_output=True, text=True, timeout=180
+            capture_output=True, text=True, timeout=900
         )
     with st.expander("Pipeline output"):
         st.code(result.stdout + result.stderr)

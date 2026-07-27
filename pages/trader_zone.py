@@ -671,10 +671,10 @@ with b1:
 with b2:
     if st.button("Run pipeline now"):
         project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        with st.spinner("Fetching new articles -- ~15-60 s..."):
+        with st.spinner("Fetching new articles -- this can take 1-10 minutes depending on how much new content there is since the last run..."):
             result = subprocess.run(
                 [sys.executable, "pipeline.py"],
-                capture_output=True, text=True, timeout=300,
+                capture_output=True, text=True, timeout=900,
                 cwd=project_dir,
             )
         with st.expander("Pipeline output", expanded=result.returncode != 0):
