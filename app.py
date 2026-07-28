@@ -309,11 +309,11 @@ if run_pipeline:
         st.code(result.stdout + result.stderr)
     # Force a hard browser reload rather than relying on rerun() over a
     # WebSocket connection that may have gone stale during the long block.
-    st.markdown(
-        "<script>setTimeout(function(){ window.location.reload(); }, 1500);</script>",
-        unsafe_allow_html=True
+    import streamlit.components.v1 as components
+    components.html(
+        "<script>setTimeout(function(){ window.parent.location.reload(); }, 1500);</script>",
+        height=0
     )
-
 conn = get_connection()
 
 # ============================================================================

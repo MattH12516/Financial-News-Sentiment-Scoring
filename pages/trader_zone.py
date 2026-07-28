@@ -681,11 +681,11 @@ with b2:
         st.success("Pipeline finished -- reloading page...")
         with st.expander("Pipeline output", expanded=result.returncode != 0):
             st.code(result.stdout + result.stderr)
-        st.markdown(
-            "<script>setTimeout(function(){ window.location.reload(); }, 1500);</script>",
-            unsafe_allow_html=True
+        import streamlit.components.v1 as components
+        components.html(
+            "<script>setTimeout(function(){ window.parent.location.reload(); }, 1500);</script>",
+            height=0
         )
-
 st.divider()
 
 # ============================================================================
