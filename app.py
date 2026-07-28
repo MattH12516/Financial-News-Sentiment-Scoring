@@ -303,10 +303,16 @@ if run_pipeline:
             [sys.executable, "pipeline.py"],
             capture_output=True, text=True, timeout=900
         )
-    with st.expander("Pipeline output"):
-        st.code(result.stdout + result.stderr)
     st.cache_data.clear()
-    st.rerun()
+    st.success("Pipeline finished -- reloading page...")
+    with st.expander("Pipeline output", expanded=True):
+        st.code(result.stdout + result.stderr)
+    # Force a hard browser reload rather than relying on rerun() over a
+    # WebSocket connection that may have gone stale during the long block.
+    st.markdown(
+        "<script>setTimeout(function(){ window.location.reload(); }, 1500);</script>",
+        unsafe_allow_html=True
+    )
 
 conn = get_connection()
 

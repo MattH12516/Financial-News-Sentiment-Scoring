@@ -677,10 +677,14 @@ with b2:
                 capture_output=True, text=True, timeout=900,
                 cwd=project_dir,
             )
+        st.cache_data.clear()
+        st.success("Pipeline finished -- reloading page...")
         with st.expander("Pipeline output", expanded=result.returncode != 0):
             st.code(result.stdout + result.stderr)
-        st.cache_data.clear()
-        st.rerun()
+        st.markdown(
+            "<script>setTimeout(function(){ window.location.reload(); }, 1500);</script>",
+            unsafe_allow_html=True
+        )
 
 st.divider()
 
