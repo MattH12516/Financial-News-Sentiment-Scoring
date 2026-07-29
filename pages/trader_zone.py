@@ -377,21 +377,25 @@ def load_all_signals_batch(ticker_tuple, since_iso):
     return result
 
 
-def compute_signal_score(tk, news_score, signals_list):
+def compute_signal_score(tk, news_score, signals_list, herd=None):
     """Evaluate six independent signal factors for a ticker.
     Returns (points, flags) where points is 0-6 and flags is a list of
     (icon, description) tuples for display in the drill-down.
 
+    `herd` is the aggregated social data for the selected time window, passed
+    in so the score and the Herd column always describe the same period.
+
     The six factors are:
     1. News sentiment > 0.3 (professional news coverage)
     2. Social bullish% >= 60% (retail crowd sentiment)
-    3. Herd keyword spike (crowd behavior language detected)
+    3. Herd keyword activity (crowd behaviour language detected)
     4. On Finviz unusual volume list (market confirmation)
-    5. Form 4 insider buying cluster (insider behavior)
+    5. Whale buying -- 3+ SEC Form 4 purchases in 24h (insider behaviour)
     6. Short squeeze setup (short float > 10% and days to cover > 5)
     """
     points = 0
     flags  = []
+    herd   = herd or {}
 
     # Factor 1: News sentiment from LLM-scored articles
     if news_score is not None and news_score > 0.3:
@@ -403,23 +407,35 @@ def compute_signal_score(tk, news_score, signals_list):
         ns = f"{news_score:+.2f}" if news_score is not None else "--"
         flags.append(("❌", f"News sentiment {ns}"))
 
-    # Factor 2: Social bullish% from Stocktwits self-reported tags
-    bull = next((s["bullish_pct"] for s in signals_list
-                 if s.get("bullish_pct") is not None), None)
+    # Factor 2: Social bullish% -- prefer the windowed herd aggregate shown in
+    # the Herd column so the score and the column never contradict each other.
+    bull = herd.get("bullish_pct")
+    if bull is None:
+        bull = next((s["bullish_pct"] for s in signals_list
+                     if s.get("bullish_pct") is not None), None)
     if bull is not None and bull >= 0.6:
         points += 1
         flags.append(("✅", f"Social {bull:.0%} bullish"))
     elif bull is not None:
         flags.append(("🔶", f"Social {bull:.0%} bullish -- below 60% threshold"))
     else:
-        flags.append(("⬜", "Social -- no data yet"))
+        flags.append(("⬜", "Social -- no data in this window"))
 
-    # Factor 3: Herd keyword spike in Stocktwits messages
-    if any(s["type"] == "social_spike" for s in signals_list):
+    # Factor 3: Herd keyword activity. Counts cumulative hits across the window
+    # rather than requiring 3+ within a single pipeline run -- sustained chatter
+    # is as meaningful as one concentrated burst, and the old version could show
+    # a high herd count in the column while reporting "no spike" here.
+    herd_hits = herd.get("herd_hits", 0)
+    if herd_hits >= 3:
+        points += 1
+        flags.append(("✅", f"Herd keyword activity -- {herd_hits} hits in window"))
+    elif any(s["type"] == "social_spike" for s in signals_list):
         points += 1
         flags.append(("✅", "Herd keyword spike detected"))
+    elif herd_hits > 0:
+        flags.append(("🔶", f"Light herd activity -- {herd_hits} hits in window"))
     else:
-        flags.append(("❌", "No herd spike"))
+        flags.append(("❌", "No herd activity in this window"))
 
     # Factor 4: Unusual volume confirmed by Finviz screener
     fv_sig = next(
@@ -833,7 +849,12 @@ with st.spinner(f"Loading live prices for {len(all_tks)} tickers..."):
     price_snap = load_price_snapshot(all_tks)
 social_badges = load_social_badges(all_tks)
 signals_batch = load_all_signals_batch(all_tks, since_iso)
-herd_data     = load_herd_data(all_tks)
+# Herd data follows the selected time window so every number on a row describes
+# the same period. Floored at 1h because pipeline runs are the real resolution
+# limit -- a 10-minute herd window would usually be empty.
+herd_hours       = max(1, minutes / 60)
+herd_window_lbl  = f"{int(herd_hours)}h"
+herd_data        = load_herd_data(all_tks, lookback_hours=herd_hours)
 relvol_map    = load_latest_relvol(all_tks)
 show_rs       = sort_mode == "composite"
 
@@ -875,7 +896,7 @@ st.markdown(f"""
         <span style="min-width:62px;text-align:right;">Day chg</span>
         <span style="min-width:48px;text-align:right;">RelVol</span>
         <span style="min-width:54px;text-align:right;">News</span>
-        <span style="min-width:88px;text-align:right;">Herd (B/S)</span>
+        <span style="min-width:88px;text-align:right;" title="Bullish/bearish message counts and herd keyword hits in the selected window">Herd {herd_window_lbl} (B/S)</span>
         <span style="min-width:60px;text-align:right;">Mkt Cap</span>
         <span style="min-width:42px;text-align:right;">Signal</span>
         {rs_hdr}
@@ -942,7 +963,7 @@ for tk, score, density, raw_count in tz_rows:
 
     # Six-factor signal score
     sig_list       = signals_batch.get(tk, [])
-    sig_pts, flags = compute_signal_score(tk, score, sig_list)
+    sig_pts, flags = compute_signal_score(tk, score, sig_list, herd_data.get(tk, {}))
     sig_cls        = "sig-high" if sig_pts >= 4 else "sig-med" if sig_pts >= 2 else "sig-low"
     sig_badge      = f'<span class="{sig_cls}">{sig_pts}/6</span>'
 
@@ -980,8 +1001,11 @@ for tk, score, density, raw_count in tz_rows:
         bp       = hd.get("bullish_pct")
         hd_color = ("#3fb950" if bp and bp >= 0.6 else
                     "#f85149" if bp and bp <= 0.4 else "#8b949e")
-        herd_flag = f' <span style="color:#e3b341;">{herd_ct}h</span>' if herd_ct else ""
-        herd_html = (f'<span style="min-width:88px;text-align:right;font-size:11px;'
+        herd_flag = (f' <span style="color:#e3b341;">+{herd_ct}</span>'
+                     if herd_ct else "")
+        herd_html = (f'<span title="Last {herd_window_lbl}: {bull_ct} bullish / '
+                     f'{bear_ct} bearish messages, {herd_ct} herd keyword hits" '
+                     f'style="min-width:88px;text-align:right;font-size:11px;'
                      f'color:{hd_color};">{bull_ct}/{bear_ct}{herd_flag}</span>')
     else:
         herd_html = '<span style="min-width:88px;"></span>'
@@ -1174,7 +1198,7 @@ else:
             <span style="min-width:80px;">Cap Tier</span>
             <span style="min-width:60px;">Short Flt</span>
             <span style="min-width:54px;">Days Cov</span>
-            <span style="min-width:88px;">Herd (B/S)</span>
+            <span style="min-width:88px;">Herd 24h (B/S)</span>
             <span style="flex:1;">News</span>
         </div>
     """, unsafe_allow_html=True)
@@ -1207,7 +1231,7 @@ else:
             uv_bp    = uv_hd.get("bullish_pct")
             uv_color = ("#3fb950" if uv_bp and uv_bp >= 0.6 else
                         "#f85149" if uv_bp and uv_bp <= 0.4 else "#8b949e")
-            uv_herd  = (f' <span style="color:#e3b341;">{uv_hd["herd_hits"]}h</span>'
+            uv_herd  = (f' <span style="color:#e3b341;">+{uv_hd["herd_hits"]}</span>'
                         if uv_hd["herd_hits"] else "")
             uv_herd_html = (f'<span style="min-width:88px;font-size:11px;'
                             f'color:{uv_color};">'
