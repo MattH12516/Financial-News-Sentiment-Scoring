@@ -152,7 +152,7 @@ def load_tickers(_conn):
 def load_articles(conn, sources, ticker, keyword, only_matched, sort_order, limit):
     """Query articles with optional filters for source, ticker, keyword, and sort order.
     Returns a pandas DataFrame with columns for display in the News Feed tab."""
-    query  = """SELECT a.id, a.title, a.source, a.link, a.ingested_at,
+    query  = """SELECT a.id, a.title, a.source, a.link, a.ingested_at, a.published,
                        a.matched_tickers, a.sentiment_score
                 FROM articles a"""
     params = []
@@ -428,7 +428,7 @@ with tab_feed:
             )
             st.markdown(f"""
                 <div class="article-row">
-                    <span class="article-time">{time_ago(row['ingested_at'])}</span>
+                    <span class="article-time">{time_ago(row['published'] or row['ingested_at'])}</span>
                     <span class="article-source">{row['source']}</span>
                     {tickers_html}
                     <a class="article-title" href="{row['link']}" target="_blank">{row['title']}</a>

@@ -21,6 +21,8 @@ Dependencies:
 from dotenv import load_dotenv
 load_dotenv()
 
+
+
 import os
 import re
 import csv
@@ -28,6 +30,7 @@ import io
 import json
 import time
 import sqlite3
+import calendar
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse
@@ -252,7 +255,7 @@ def _finviz_screener_url(api_key):
     return (
         "https://elite.finviz.com/export/screener"
         "?v=152"
-        "&f=sh_relvol_o1,geo_usa"
+        "&f=geo_usa"
         "&o=-relativevolume"
         "&rows=500"
         f"&auth={api_key}"
@@ -481,7 +484,43 @@ def article_exists(conn, link):
     return conn.execute(
         "SELECT 1 FROM articles WHERE link = ? LIMIT 1", (link,)
     ).fetchone() is not None
+def _published_to_iso(entry):
+    """Return an RSS/Atom entry's publish time as a UTC ISO string, or None.
+    feedparser's parsed time struct is more reliable than the raw string,
+    which varies in format across feeds."""
+    try:
+        pub = entry.get("published_parsed") or entry.get("updated_parsed")
+        if pub:
+            return datetime.fromtimestamp(
+                calendar.timegm(pub), tz=timezone.utc
+            ).isoformat()
+    except Exception:
+        pass
+    return None
 
+
+def _event_time(published, ingested_at):
+    """Timestamp used for all timeline analysis -- charts, density buckets,
+    and Trader Zone windows.
+
+    Uses the article's actual publish time when available so a news spike lands
+    at the moment the news broke, not the moment we happened to fetch it.
+    Falls back to ingest time when no usable publish date exists.
+
+    Rejects timestamps in the future or absurdly far in the past, which some
+    feeds emit due to timezone errors -- those would otherwise plot ahead of
+    real time on the chart."""
+    if published:
+        try:
+            dt = datetime.fromisoformat(published)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            now = datetime.now(timezone.utc)
+            if timedelta(0) <= (now - dt) <= timedelta(days=365):
+                return dt.astimezone(timezone.utc).isoformat()
+        except Exception:
+            pass
+    return ingested_at
 
 def save_article(conn, link, title, summary, body, source, published,
                  tickers, form_type, scores, form4_data=None,
@@ -517,13 +556,17 @@ def save_article(conn, link, title, summary, body, source, published,
     # Only write ticker mentions for new articles (rowcount=1 means insert succeeded)
     if cur.rowcount == 1 and tickers:
         article_id = cur.lastrowid
+        # Timeline analysis keys off when the news actually broke, not when we
+        # fetched it -- otherwise a catch-up run collapses hours of articles
+        # into one artificial spike.
+        event_at = _event_time(published, ingested_at)
         for tk in tickers:
             tk_info = scores.get(tk, {})
             conn.execute(
                 "INSERT INTO ticker_mentions "
                 "(ticker, article_id, mentioned_at, weight, score, reasoning) "
                 "VALUES (?,?,?,?,?,?)",
-                (tk, article_id, ingested_at, weights.get(tk, 1.0),
+                (tk, article_id, event_at, weights.get(tk, 1.0),
                  tk_info.get("score"), tk_info.get("reasoning"))
             )
 
@@ -1420,7 +1463,7 @@ def main():
             to_process.append({
                 "link": link, "title": title, "summary": summary,
                 "form_type": form_type, "tickers": tickers,
-                "published": entry.get("published", ""), "body": None,
+                "published": _published_to_iso(entry) or "", "body": None,
                 "form4_data": None,
             })
 

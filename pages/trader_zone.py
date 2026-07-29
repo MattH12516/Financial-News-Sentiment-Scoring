@@ -954,12 +954,20 @@ for tk, score, density, raw_count in tz_rows:
     live_rv   = None
     if pd_snap.get("volume") and pd_snap.get("avg_vol") and pd_snap["avg_vol"] > 0:
         live_rv = pd_snap["volume"] / pd_snap["avg_vol"]
-    relvol_val = finviz_rv or live_rv
+    # Finviz and yfinance compute relvol differently, so mark which source this
+    # came from -- a yfinance-derived figure will not correspond to the Finviz
+    # unusual volume list, which is why a high "~" value may not appear there.
+    relvol_val = finviz_rv if finviz_rv else live_rv
     if relvol_val:
-        rv_color = ("#3fb950" if relvol_val >= 3 else
-                    "#e3b341" if relvol_val >= 1.5 else "#6e7681")
-        rv_html  = (f'<span style="color:{rv_color};font-size:11px;'
-                    f'min-width:48px;text-align:right;">{relvol_val:.1f}x</span>')
+        is_finviz = finviz_rv is not None
+        rv_color  = ("#3fb950" if relvol_val >= 3 else
+                     "#e3b341" if relvol_val >= 1.5 else "#6e7681")
+        prefix    = "" if is_finviz else "~"
+        title     = ("Finviz relative volume" if is_finviz
+                     else "Estimated from yfinance -- not a Finviz figure, "
+                          "so it will not match the unusual volume list")
+        rv_html   = (f'<span title="{title}" style="color:{rv_color};font-size:11px;'
+                     f'min-width:48px;text-align:right;">{prefix}{relvol_val:.1f}x</span>')
     else:
         rv_html = '<span style="min-width:48px;"></span>'
 
@@ -1061,10 +1069,11 @@ for tk, score, density, raw_count in tz_rows:
         if any(fund.values()):
             f1, f2, f3, f4, f5 = st.columns(5)
             with f1:
-                mc_disp = fmt_market_cap(fund.get("market_cap"))
+                fwd_pe = fund.get("fwd_pe")
                 st.markdown(
-                    f'<span class="fund-label">Market cap</span>'
-                    f'<span class="fund-value">{mc_disp}</span>',
+                    f'<span class="fund-label">Forward P/E</span>'
+                    f'<span class="fund-value">'
+                    f'{f"{fwd_pe:.1f}" if fwd_pe else "--"}</span>',
                     unsafe_allow_html=True
                 )
             with f2:
@@ -1165,6 +1174,7 @@ else:
             <span style="min-width:80px;">Cap Tier</span>
             <span style="min-width:60px;">Short Flt</span>
             <span style="min-width:54px;">Days Cov</span>
+            <span style="min-width:88px;">Herd (B/S)</span>
             <span style="flex:1;">News</span>
         </div>
     """, unsafe_allow_html=True)
@@ -1190,6 +1200,21 @@ else:
         )
         rv_str = f"{rv:.1f}x" if rv else "--"
 
+        # Social herd context -- volume alone does not say whether the crowd is
+        # behind the move, which is the distinction that matters here.
+        uv_hd = load_herd_data((tk,)).get(tk, {})
+        if uv_hd.get("total_posts"):
+            uv_bp    = uv_hd.get("bullish_pct")
+            uv_color = ("#3fb950" if uv_bp and uv_bp >= 0.6 else
+                        "#f85149" if uv_bp and uv_bp <= 0.4 else "#8b949e")
+            uv_herd  = (f' <span style="color:#e3b341;">{uv_hd["herd_hits"]}h</span>'
+                        if uv_hd["herd_hits"] else "")
+            uv_herd_html = (f'<span style="min-width:88px;font-size:11px;'
+                            f'color:{uv_color};">'
+                            f'{uv_hd["bullish_ct"]}/{uv_hd["bearish_ct"]}{uv_herd}</span>')
+        else:
+            uv_herd_html = '<span style="min-width:88px;color:#6e7681;font-size:11px;">--</span>'
+
         st.markdown(f"""
             <div style="padding:9px 14px;border-bottom:1px solid #262730;
                         display:flex;align-items:center;gap:12px;">
@@ -1209,6 +1234,7 @@ else:
                     {sf}</span>
                 <span style="color:#8b949e;font-size:12px;min-width:54px;">
                     {sr}</span>
+                {uv_herd_html}
                 <span style="flex:1;">{news_html}</span>
             </div>
         """, unsafe_allow_html=True)
