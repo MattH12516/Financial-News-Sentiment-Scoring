@@ -80,6 +80,33 @@ st.markdown("""
 # DATABASE HELPERS
 # ============================================================================
 
+from zoneinfo import ZoneInfo
+
+EASTERN = ZoneInfo("America/New_York")
+
+
+def to_eastern(dt_series):
+    """Convert a datetime series (naive-UTC or tz-aware) to Eastern for display.
+    All chart traces must go through this so they align on the same x-axis --
+    mixing tz-aware and tz-naive series causes visible misalignment in Plotly."""
+    dt_series = pd.to_datetime(dt_series)
+    if dt_series.dt.tz is None:
+        dt_series = dt_series.dt.tz_localize("UTC")
+    else:
+        dt_series = dt_series.dt.tz_convert("UTC")
+    return dt_series.dt.tz_convert(EASTERN)
+
+
+def scale_marker_sizes(counts, min_size=6, max_size=22):
+    """Scale a series of sample-size counts into pixel marker sizes so a
+    reader can see at a glance whether a point represents 2 messages or 50."""
+    counts = pd.Series(counts).fillna(0)
+    if counts.max() == counts.min():
+        return [min_size] * len(counts)
+    scaled = min_size + (counts - counts.min()) / (counts.max() - counts.min()) * (max_size - min_size)
+    return scaled.tolist()
+
+
 def get_connection():
     """Return a SQLite connection to the pipeline database."""
     return sqlite3.connect(pipeline.DB_PATH, check_same_thread=False)
@@ -239,21 +266,40 @@ def load_price_data(ticker, period, interval):
 
 @st.cache_data(ttl=300, show_spinner=False)
 def load_social_series(_conn, ticker, since_iso):
-    """Return social signal readings (bullish%, keyword_hits) for the Ticker Chart overlay.
-    Data comes from the signals table populated each pipeline run."""
+    """Return hourly social message density (bullish/bearish counts) for the
+    Ticker Chart overlay. Bucketed the same way as news sentiment so both
+    series carry visible sample sizes. Falls back to post_count for older
+    rows written before bullish_count/bearish_count existed."""
     try:
         rows = _conn.execute("""
-            SELECT detected_at, bullish_pct, keyword_hits, signal_type
+            SELECT strftime('%Y-%m-%dT%H:00:00', detected_at) AS hour,
+                   AVG(bullish_pct)                              AS avg_bullish_pct,
+                   SUM(COALESCE(bullish_count, 0))                AS bullish_ct,
+                   SUM(COALESCE(bearish_count, 0))                AS bearish_ct,
+                   SUM(COALESCE(post_count, 0))                   AS total_posts,
+                   SUM(COALESCE(keyword_hits, 0))                 AS herd_hits
             FROM   signals
             WHERE  ticker = ? AND detected_at >= ?
-            ORDER  BY detected_at
+              AND  signal_type IN ('social_spike','social_read')
+            GROUP  BY hour
+            ORDER  BY hour
         """, (ticker, since_iso)).fetchall()
     except Exception:
-        return pd.DataFrame(columns=["detected_at", "bullish_pct", "keyword_hits", "signal_type"])
+        return pd.DataFrame(columns=[
+            "hour", "avg_bullish_pct", "bullish_ct", "bearish_ct", "total_posts", "herd_hits"
+        ])
     if not rows:
-        return pd.DataFrame(columns=["detected_at", "bullish_pct", "keyword_hits", "signal_type"])
-    df = pd.DataFrame(rows, columns=["detected_at", "bullish_pct", "keyword_hits", "signal_type"])
-    df["detected_at"] = pd.to_datetime(df["detected_at"])
+        return pd.DataFrame(columns=[
+            "hour", "avg_bullish_pct", "bullish_ct", "bearish_ct", "total_posts", "herd_hits"
+        ])
+    df = pd.DataFrame(rows, columns=[
+        "hour", "avg_bullish_pct", "bullish_ct", "bearish_ct", "total_posts", "herd_hits"
+    ])
+    df["hour"] = pd.to_datetime(df["hour"])
+    # Sample size for marker scaling -- prefer explicit bullish+bearish counts,
+    # fall back to total_posts for rows written before those columns existed.
+    df["sample_size"] = df["bullish_ct"] + df["bearish_ct"]
+    df.loc[df["sample_size"] == 0, "sample_size"] = df["total_posts"]
     return df
 
 
@@ -337,7 +383,14 @@ with tab_feed:
         all_sources = load_sources(conn)
         sources     = st.multiselect("Source", all_sources, default=all_sources)
     with fcol2:
-        feed_ticker = st.selectbox("Ticker", ["All"] + load_tickers(conn))
+        feed_ticker_all = load_tickers(conn)
+        ticker_search   = st.text_input(
+            "Search ticker", placeholder="type any ticker..."
+        ).strip().upper()
+        if ticker_search:
+            feed_ticker = ticker_search
+        else:
+            feed_ticker = st.selectbox("Or select", ["All"] + feed_ticker_all)
     with fcol3:
         keyword = st.text_input("Search title/body", placeholder="e.g. earnings, merger...")
     with fcol4:
@@ -404,7 +457,6 @@ with tab_chart:
     else:
         ccol1, ccol2 = st.columns([1, 3])
         with ccol1:
-            # Free-text input allows charting any ticker even without DB history
             manual_ticker = st.text_input(
                 "Type any ticker", placeholder="e.g. AAPL...",
                 help="Any ticker for price data. Sentiment/density shown only for tickers with DB history."
@@ -429,7 +481,10 @@ with tab_chart:
                 in_db = True
 
             timeframe = st.radio(
-                "Timeframe", ["1 day", "1 week", "1 month", "Custom"], index=1
+                "Timeframe",
+                ["10 min", "30 min", "1 hour", "1 day", "1 week", "1 month", "Custom"],
+                index=3,
+                help="Short-term windows use 1-minute bars to zoom into how price reacts around a specific event."
             )
             if timeframe == "Custom":
                 date_range = st.date_input(
@@ -441,11 +496,16 @@ with tab_chart:
                     max_value=datetime.now(timezone.utc).date(),
                 )
 
-        # Map timeframe selections to database lookback and yfinance parameters
+        # Map timeframe selections to database lookback (minutes) and yfinance params.
+        # Short windows fetch the finest yfinance interval (1m) then get trimmed
+        # client-side to the exact requested window.
         tf_map = {
-            "1 day":   {"days": 1,  "yf_period": "1d",  "yf_interval": "5m"},
-            "1 week":  {"days": 7,  "yf_period": "5d",  "yf_interval": "30m"},
-            "1 month": {"days": 30, "yf_period": "1mo", "yf_interval": "1h"},
+            "10 min":  {"minutes": 10,    "yf_period": "1d",  "yf_interval": "1m"},
+            "30 min":  {"minutes": 30,    "yf_period": "1d",  "yf_interval": "1m"},
+            "1 hour":  {"minutes": 60,    "yf_period": "1d",  "yf_interval": "1m"},
+            "1 day":   {"minutes": 1440,  "yf_period": "1d",  "yf_interval": "5m"},
+            "1 week":  {"minutes": 10080, "yf_period": "5d",  "yf_interval": "30m"},
+            "1 month": {"minutes": 43200, "yf_period": "1mo", "yf_interval": "1h"},
         }
         if timeframe == "Custom" and len(date_range) == 2:
             start_date, end_date = date_range
@@ -455,44 +515,61 @@ with tab_chart:
             days_delta  = (end_date - start_date).days
             yf_period   = f"{max(days_delta, 1)}d"
             yf_interval = "1h" if days_delta > 7 else "30m"
+            since_cutoff_utc = datetime.combine(
+                start_date, datetime.min.time()
+            ).replace(tzinfo=timezone.utc)
         else:
             tf          = tf_map[timeframe]
-            since_iso   = (datetime.now(timezone.utc) - timedelta(days=tf["days"])).isoformat()
+            since_cutoff_utc = datetime.now(timezone.utc) - timedelta(minutes=tf["minutes"])
+            since_iso   = since_cutoff_utc.isoformat()
             yf_period   = tf["yf_period"]
             yf_interval = tf["yf_interval"]
 
         sentiment_df = load_sentiment_series(conn, chart_ticker, since_iso)
         density_df   = load_density_series(conn, chart_ticker, since_iso)
+        social_df    = load_social_series(conn, chart_ticker, since_iso)
         price_df     = load_price_data(chart_ticker, yf_period, yf_interval)
 
         with ccol2:
             has_sentiment = not sentiment_df.empty
             has_density   = not density_df.empty
+            has_social    = not social_df.empty and social_df["avg_bullish_pct"].notna().any()
             has_price     = not price_df.empty
 
-            if not has_sentiment and not has_density and not has_price:
+            if not has_price and timeframe in ("10 min", "30 min", "1 hour", "1 day", "1 week"):
+                st.caption(
+                    f"No intraday price data available for **{chart_ticker}** at this "
+                    "interval. This is a common Yahoo Finance data gap for lower-volume "
+                    "tickers at fine intervals, not an app error -- try a wider timeframe."
+                )
+
+            if not has_sentiment and not has_density and not has_price and not has_social:
                 st.info(f"No data found for **{chart_ticker}** in this timeframe yet.")
             else:
                 fig = make_subplots(specs=[[{"secondary_y": True}]])
 
                 # Message density bars -- raw mention counts on the left Y axis
                 if has_density:
+                    density_df["hour_et"] = to_eastern(density_df["hour"])
                     fig.add_trace(go.Bar(
-                        x=density_df["hour"], y=density_df["mentions"],
-                        name="Message density",
+                        x=density_df["hour_et"], y=density_df["mentions"],
+                        name="News message density",
                         marker_color="rgba(251,140,0,0.8)",
-                        hovertemplate="%{y} mentions<extra></extra>",
+                        hovertemplate="%{y} articles<extra></extra>",
                     ), secondary_y=False)
 
-                # Average sentiment line -- per-hour LLM scores
+                # Average news sentiment line -- marker size shows sample size per point
                 if has_sentiment:
+                    sentiment_df["hour_et"] = to_eastern(sentiment_df["hour"])
+                    sizes = scale_marker_sizes(sentiment_df["mentions"])
                     fig.add_trace(go.Scatter(
-                        x=sentiment_df["hour"], y=sentiment_df["avg_score"],
-                        name="Avg sentiment",
+                        x=sentiment_df["hour_et"], y=sentiment_df["avg_score"],
+                        name="Avg news sentiment",
                         mode="lines+markers",
                         line=dict(color="#58a6ff", width=2),
-                        marker=dict(size=6),
-                        hovertemplate="%{y:+.2f}<extra></extra>",
+                        marker=dict(size=sizes, line=dict(width=1, color="#0e1117")),
+                        customdata=sentiment_df["mentions"],
+                        hovertemplate="%{y:+.2f} (%{customdata} articles)<extra></extra>",
                     ), secondary_y=False)
                     fig.add_hline(
                         y=0, line_dash="dot",
@@ -500,17 +577,23 @@ with tab_chart:
                         secondary_y=False
                     )
 
-                # Social bullish% dotted line -- Stocktwits retail sentiment readings
-                social_df = load_social_series(conn, chart_ticker, since_iso)
-                if not social_df.empty and social_df["bullish_pct"].notna().any():
+                # Social bullish% line -- marker size shows message sample size,
+                # hover shows the bullish/bearish split explicitly
+                if has_social:
+                    social_df["hour_et"] = to_eastern(social_df["hour"])
+                    sizes = scale_marker_sizes(social_df["sample_size"])
                     fig.add_trace(go.Scatter(
-                        x=social_df["detected_at"],
-                        y=social_df["bullish_pct"],
+                        x=social_df["hour_et"], y=social_df["avg_bullish_pct"],
                         name="Social bullish%",
                         mode="lines+markers",
                         line=dict(color="#bc8cff", width=2, dash="dot"),
-                        marker=dict(size=5),
-                        hovertemplate="%{y:.0%} bullish<extra></extra>",
+                        marker=dict(size=sizes, line=dict(width=1, color="#0e1117")),
+                        customdata=list(zip(social_df["bullish_ct"], social_df["bearish_ct"])),
+                        hovertemplate=(
+                            "%{y:.0%} bullish<br>"
+                            "%{customdata[0]:.0f} bullish / %{customdata[1]:.0f} bearish"
+                            "<extra></extra>"
+                        ),
                     ), secondary_y=False)
 
                 # Stock price line on the right Y axis
@@ -519,8 +602,12 @@ with tab_chart:
                         "Datetime" if "Datetime" in price_df.columns
                         else price_df.columns[0]
                     )
+                    price_df["ts_et"] = to_eastern(price_df[price_col])
+                    price_df_trimmed = price_df[price_df["ts_et"] >= since_cutoff_utc.astimezone(EASTERN)]
+                    if price_df_trimmed.empty:
+                        price_df_trimmed = price_df
                     fig.add_trace(go.Scatter(
-                        x=price_df[price_col], y=price_df["price"],
+                        x=price_df_trimmed["ts_et"], y=price_df_trimmed["price"],
                         name="Stock price",
                         mode="lines",
                         line=dict(color="#3fb950", width=2),
@@ -529,7 +616,7 @@ with tab_chart:
 
                 fig.update_layout(
                     title=dict(
-                        text=f"{chart_ticker} -- Sentiment / Density / Price",
+                        text=f"{chart_ticker} -- Sentiment / Density / Price (Eastern time)",
                         font=dict(color="#e6edf3")
                     ),
                     paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
@@ -540,7 +627,7 @@ with tab_chart:
                     xaxis=dict(gridcolor="#1c1f26", showgrid=True),
                     yaxis=dict(
                         gridcolor="#1c1f26", showgrid=True,
-                        title="Sentiment / Density (mentions)"
+                        title="Sentiment / Density"
                     ),
                     barmode="overlay",
                     yaxis2=dict(title="Price (USD)", showgrid=False),
@@ -548,139 +635,162 @@ with tab_chart:
                 st.plotly_chart(fig, use_container_width=True)
 
                 # Summary metrics below the chart
-                scol1, scol2, scol3 = st.columns(3)
+                scol1, scol2, scol3, scol4 = st.columns(4)
                 with scol1:
                     if has_sentiment:
-                        st.metric("Avg sentiment", f"{sentiment_df['avg_score'].mean():+.2f}")
+                        st.metric("Avg news sentiment", f"{sentiment_df['avg_score'].mean():+.2f}")
                 with scol2:
                     if has_density:
-                        st.metric("Total mentions", int(density_df["mentions"].sum()))
+                        st.metric("Total news mentions", int(density_df["mentions"].sum()))
                 with scol3:
+                    if has_social:
+                        st.metric("Avg social bullish%", f"{social_df['avg_bullish_pct'].mean():.0%}")
+                with scol4:
                     if has_price:
-                        latest   = price_df["price"].iloc[-1]
-                        earliest = price_df["price"].iloc[0]
+                        latest   = price_df_trimmed["price"].iloc[-1]
+                        earliest = price_df_trimmed["price"].iloc[0]
                         chg      = 100 * (latest - earliest) / earliest
                         st.metric("Price change", f"${latest:.2f}", f"{chg:+.2f}%")
 
-                if not has_price:
-                    st.caption(
-                        f"No price data for **{chart_ticker}** -- "
-                        "may not trade on a major US exchange."
-                    )
                 if not has_sentiment:
                     st.caption(
-                        "Sentiment appears once scored articles exist for this ticker."
+                        "News sentiment appears once scored articles exist for this ticker."
+                    )
+                if not has_social:
+                    st.caption(
+                        "Social data appears once Stocktwits signals exist for this ticker "
+                        "-- populated by the pipeline, not fetched live on this chart."
                     )
 
 
 # ============================================================================
-# TAB 3 -- SOCIAL FEED
+# TAB 3 -- SOCIAL FEED (HERD RADAR)
 # ============================================================================
 with tab_social:
-    st.markdown("#### Social Feed -- Stocktwits Herd Sentiment")
+    st.markdown("#### Herd Radar -- Where Is Social Attention Right Now")
     st.caption(
-        "Live retail trader posts from Stocktwits. "
-        "Bullish/bearish tags are self-reported by the poster. "
-        "Herd signal flags posts containing keywords such as whale, squeeze, or unusual flow."
+        "Tickers ranked by current Stocktwits social activity, drawn from the "
+        "pipeline's most recent runs. Bullish/bearish tags are self-reported by "
+        "posters. Herd signal = 3+ posts containing keywords like whale, squeeze, "
+        "or unusual flow."
     )
 
-    sf1, sf2 = st.columns([1, 3])
-    with sf1:
+    rc1, rc2 = st.columns([1, 3])
+    with rc1:
+        radar_window = st.selectbox(
+            "Activity within",
+            ["1 hour", "4 hours", "12 hours", "24 hours"],
+            index=3,
+            key="radar_window"
+        )
+    radar_hours_map = {"1 hour": 1, "4 hours": 4, "12 hours": 12, "24 hours": 24}
+    radar_hours = radar_hours_map[radar_window]
+    radar_cutoff = (datetime.now(timezone.utc) - timedelta(hours=radar_hours)).isoformat()
+
+    radar_rows = conn.execute("""
+        SELECT ticker,
+               MAX(detected_at)              AS last_seen,
+               AVG(bullish_pct)               AS avg_bullish_pct,
+               SUM(COALESCE(bullish_count,0)) AS bullish_ct,
+               SUM(COALESCE(bearish_count,0)) AS bearish_ct,
+               SUM(COALESCE(post_count,0))    AS total_posts,
+               SUM(COALESCE(keyword_hits,0))  AS herd_hits,
+               MAX(CASE WHEN signal_type='social_spike' THEN 1 ELSE 0 END) AS has_spike
+        FROM   signals
+        WHERE  signal_type IN ('social_spike','social_read')
+          AND  detected_at >= ?
+        GROUP  BY ticker
+        ORDER  BY herd_hits DESC, total_posts DESC
+    """, (radar_cutoff,)).fetchall()
+
+    if not radar_rows:
+        st.info(f"No social activity recorded in the last {radar_window}. Run the pipeline to populate.")
+    else:
+        st.markdown("""
+            <div style="padding:6px 14px;display:flex;gap:12px;
+                        border-bottom:1px solid #3d444d;color:#6e7681;font-size:12px;">
+                <span style="min-width:70px;">Ticker</span>
+                <span style="min-width:90px;">Messages</span>
+                <span style="min-width:110px;">Bullish/Bearish</span>
+                <span style="min-width:90px;">Bullish%</span>
+                <span style="min-width:90px;">Herd hits</span>
+                <span style="min-width:70px;text-align:right;">Last seen</span>
+            </div>
+        """, unsafe_allow_html=True)
+
+        for row in radar_rows[:30]:
+            (tk, last_seen, avg_bp, bull_ct, bear_ct, total_posts,
+             herd_hits, has_spike) = row
+            bp_str   = f"{avg_bp:.0%}" if avg_bp is not None else "--"
+            bp_color = (
+                "#3fb950" if avg_bp and avg_bp >= 0.6 else
+                "#f85149" if avg_bp and avg_bp <= 0.4 else "#8b949e"
+            )
+            spike_flag = " (spike)" if has_spike else ""
+            herd_color = "#e3b341" if herd_hits > 0 else "#6e7681"
+
+            st.markdown(f"""
+                <div style="padding:9px 14px;border-bottom:1px solid #262730;
+                            display:flex;align-items:center;gap:12px;">
+                    <span style="color:#58a6ff;font-weight:700;min-width:70px;">
+                        {tk}{spike_flag}</span>
+                    <span style="color:#8b949e;font-size:12px;min-width:90px;">
+                        {int(total_posts)} total</span>
+                    <span style="color:#8b949e;font-size:12px;min-width:110px;">
+                        {int(bull_ct)} / {int(bear_ct)}</span>
+                    <span style="color:{bp_color};font-weight:600;min-width:90px;">
+                        {bp_str}</span>
+                    <span style="color:{herd_color};font-weight:600;min-width:90px;">
+                        {int(herd_hits)}</span>
+                    <span style="color:#6e7681;font-size:11px;min-width:70px;text-align:right;">
+                        {time_ago(last_seen)}</span>
+                </div>
+            """, unsafe_allow_html=True)
+
+        st.caption(f"{len(radar_rows)} tickers with social activity in the last {radar_window}")
+
+    st.divider()
+    with st.expander("Look up a specific ticker live (not cached, fetches Stocktwits directly)"):
         social_ticker = st.text_input(
             "Ticker", placeholder="e.g. AAPL...", key="social_ticker_input"
         ).strip().upper()
         fetch_btn = st.button("Fetch stream", type="primary", key="fetch_social")
 
-    if social_ticker and fetch_btn:
-        with st.spinner(f"Fetching ${social_ticker} stream..."):
-            try:
-                import requests as _req
-                r = _req.get(
-                    f"https://api.stocktwits.com/api/2/streams/symbol/{social_ticker}.json",
-                    headers={"User-Agent": "Mozilla/5.0"},
-                    timeout=10,
-                    params={"limit": 30},
+        if social_ticker and fetch_btn:
+            with st.spinner(f"Fetching ${social_ticker} stream..."):
+                try:
+                    import requests as _req
+                    r = _req.get(
+                        f"https://api.stocktwits.com/api/2/streams/symbol/{social_ticker}.json",
+                        headers={"User-Agent": "Mozilla/5.0"},
+                        timeout=10,
+                        params={"limit": 30},
+                    )
+                    sdata = r.json() if r.status_code == 200 else None
+                    if r.status_code == 404:
+                        st.warning(f"${social_ticker} not found on Stocktwits.")
+                    elif r.status_code != 200:
+                        st.error(f"HTTP {r.status_code}")
+                except Exception as e:
+                    st.error(f"Error: {e}")
+                    sdata = None
+
+            if sdata:
+                msgs    = sdata.get("messages", [])
+                bullish = sum(
+                    1 for m in msgs
+                    if ((m.get("entities") or {}).get("sentiment") or {}).get("basic") == "Bullish"
                 )
-                sdata = r.json() if r.status_code == 200 else None
-                if r.status_code == 404:
-                    st.warning(f"${social_ticker} not found on Stocktwits.")
-                elif r.status_code != 200:
-                    st.error(f"HTTP {r.status_code}")
-            except Exception as e:
-                st.error(f"Error: {e}")
-                sdata = None
-
-        if sdata:
-            msgs    = sdata.get("messages", [])
-            bullish = sum(
-                1 for m in msgs
-                if ((m.get("entities") or {}).get("sentiment") or {}).get("basic") == "Bullish"
-            )
-            bearish = sum(
-                1 for m in msgs
-                if ((m.get("entities") or {}).get("sentiment") or {}).get("basic") == "Bearish"
-            )
-            tagged  = bullish + bearish
-
-            with sf2:
+                bearish = sum(
+                    1 for m in msgs
+                    if ((m.get("entities") or {}).get("sentiment") or {}).get("basic") == "Bearish"
+                )
+                tagged  = bullish + bearish
                 m1, m2, m3, m4 = st.columns(4)
                 m1.metric("Messages", len(msgs))
                 m2.metric("Bullish",  bullish)
                 m3.metric("Bearish",  bearish)
                 m4.metric("Ratio",    f"{bullish/tagged:.0%}" if tagged else "--")
-
-            st.divider()
-
-            # Herd keyword and emoji sets for detecting crowd activity
-            HERD_KW  = {
-                "whale", "whales", "insider", "loading", "loaded", "calls", "puts",
-                "yolo", "squeeze", "dd", "options", "flow", "sweep", "unusual",
-                "fomo", "breakout", "accumulating",
-            }
-            HERD_EMO = {"🐋", "🚀", "💎", "🙌"}
-
-            herd_hits = sum(
-                1 for m in msgs
-                if any(k in (m.get("body") or "").lower() for k in HERD_KW)
-                or any(e in (m.get("body") or "") for e in HERD_EMO)
-            )
-
-            # Bullish/bearish ratio bar using block characters for clear visual proportion
-            if tagged > 0:
-                ratio_pct  = bullish / tagged
-                bar_filled = int(ratio_pct * 30)
-                bar_empty  = 30 - bar_filled
-                bar_color  = (
-                    "#3fb950" if ratio_pct >= 0.6 else
-                    "#f85149" if ratio_pct <= 0.4 else "#8b949e"
-                )
-                st.markdown(f"""
-                    <div style="margin:12px 0 4px;">
-                        <span style="color:#6e7681;font-size:12px;">Bullish/bearish ratio</span>
-                    </div>
-                    <div style="font-family:monospace;font-size:14px;color:{bar_color};">
-                        {"█" * bar_filled}{"░" * bar_empty} {ratio_pct:.0%} bullish
-                    </div>
-                """, unsafe_allow_html=True)
-
-            # Herd signal alert when keyword activity is detected
-            if herd_hits > 0:
-                st.markdown(f"""
-                    <div style="margin-top:12px;padding:10px 14px;
-                                background:rgba(227,179,65,0.1);
-                                border-left:3px solid #e3b341;border-radius:4px;">
-                        <span style="color:#e3b341;font-weight:600;">
-                        {herd_hits} herd signal post{"s" if herd_hits > 1 else ""} detected
-                        </span>
-                        <span style="color:#6e7681;font-size:12px;">
-                        -- posts mentioning whale activity, unusual flow, squeeze, or options positioning
-                        </span>
-                    </div>
-                """, unsafe_allow_html=True)
-            else:
-                st.caption("No herd keywords detected in this stream.")
-    elif not social_ticker:
-        st.info("Enter a ticker above and click Fetch stream.")
 
 
 # ============================================================================

@@ -146,19 +146,116 @@ TV_API_URL = (
 # FINVIZ ELITE CONFIG
 # ============================================================================
 
-# Finviz Elite API key loaded from .env -- key regenerates periodically
-FINVIZ_API_KEY = os.getenv("FINVIZ_API_KEY", "")
+# Finviz Elite login credentials loaded from .env. The API key itself regenerates
+# periodically, so instead of storing a static key we log in fresh each pipeline
+# run and pull the current key directly from the account's API explanation page.
+FINVIZ_EMAIL    = os.getenv("FINVIZ_EMAIL", "")
+FINVIZ_PASSWORD = os.getenv("FINVIZ_PASSWORD", "")
+# Fallback for local/manual testing if login credentials are not configured
+FINVIZ_STATIC_KEY = os.getenv("FINVIZ_API_KEY", "")
 
-# Screener export URL -- v=152 includes relative volume and short data columns.
-# sh_relvol_o1 fetches all stocks with relvol > 1x; tiered filtering applied in Python.
-FINVIZ_SCREENER_URL = (
-    "https://elite.finviz.com/export/screener"
-    "?v=152"
-    "&f=sh_relvol_o1,geo_usa"
-    "&o=-relativevolume"
-    "&rows=500"
-    f"&auth={FINVIZ_API_KEY}"
-)
+_finviz_api_key_cache = None  # cached for the duration of a single pipeline run
+def _finviz_validate_key(api_key):
+    """Return True if this key returns a valid CSV export from the screener endpoint.
+    Used to identify which UUID on the API page is the actual auth token."""
+    test_url = (
+        "https://elite.finviz.com/export/screener"
+        "?v=111&f=sh_relvol_o1&rows=1"
+        f"&auth={api_key}"
+    )
+    try:
+        r = requests.get(
+            test_url, headers={"User-Agent": BROWSER_UA}, timeout=REQUEST_TIMEOUT
+        )
+        if r.status_code != 200:
+            return False
+        first_line = r.text.split("\n")[0] if r.text else ""
+        return "Ticker" in first_line
+    except Exception:
+        return False
+    
+def _finviz_login_and_fetch_key():
+    """Log into Finviz using a persistent session (so all cookies set across the
+    login flow -- not just .ASPXAUTH -- carry forward correctly) and pull the
+    current API key from the account's api_explanation page.
+    Returns the API key string, or None on failure."""
+    if not FINVIZ_EMAIL or not FINVIZ_PASSWORD:
+        print("   [Finviz login] FINVIZ_EMAIL/FINVIZ_PASSWORD not set")
+        return None
+    try:
+        if _HAS_CURL:
+            session = creq.Session(impersonate=IMPERSONATE)
+        else:
+            session = requests.Session()
+            session.headers.update({"User-Agent": BROWSER_UA})
+
+        # Load the login page first to pick up any session/CSRF cookies Finviz sets
+        # before the login form is submitted.
+        session.get("https://finviz.com/login-email?remember=true", timeout=REQUEST_TIMEOUT)
+
+        resp = session.post(
+            "https://finviz.com/login_submit",
+            data={"email": FINVIZ_EMAIL, "password": FINVIZ_PASSWORD, "remember": "true"},
+            timeout=REQUEST_TIMEOUT,
+        )
+        print(f"   [Finviz login] status={resp.status_code} using_curl_cffi={_HAS_CURL}")
+
+        key_resp = session.get(
+            "https://elite.finviz.com/api_explanation", timeout=REQUEST_TIMEOUT
+        )
+        print(f"   [Finviz api_explanation] status={key_resp.status_code} "
+              f"len={len(key_resp.text)}")
+
+        # The example URL containing "auth=" is rendered client-side by JavaScript,
+        # so the raw HTML only contains the bare UUID. Collect every UUID on the
+        # page and validate each against the real screener endpoint -- more robust
+        # than assuming a fixed position, since the page may contain several.
+        candidates = re.findall(
+            r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
+            key_resp.text
+        )
+        seen = []
+        for cand in candidates:
+            if cand in seen:
+                continue
+            seen.append(cand)
+            if _finviz_validate_key(cand):
+                return cand
+
+        print(f"   [Finviz api_explanation] found {len(seen)} UUID candidate(s) but "
+              "none returned valid screener data -- Elite subscription may be inactive")
+        return None
+    except Exception as e:
+        print(f"   [Finviz login] error: {type(e).__name__}: {e}")
+        return None
+
+def get_finviz_api_key():
+    """Return a current Finviz API key. Logs in fresh if credentials are configured,
+    falling back to a static key from .env if login is not set up.
+    Cached in-memory for the remainder of this pipeline run."""
+    global _finviz_api_key_cache
+    if _finviz_api_key_cache:
+        return _finviz_api_key_cache
+
+    if FINVIZ_EMAIL and FINVIZ_PASSWORD:
+        key = _finviz_login_and_fetch_key()
+        if key:
+            print("   [Finviz] fresh API key obtained via login")
+            _finviz_api_key_cache = key
+            return key
+        print("   [Finviz] login flow failed -- falling back to static key if set")
+
+
+def _finviz_screener_url(api_key):
+    """Build the screener export URL for the given API key."""
+    return (
+        "https://elite.finviz.com/export/screener"
+        "?v=152"
+        "&f=sh_relvol_o1,geo_usa"
+        "&o=-relativevolume"
+        "&rows=500"
+        f"&auth={api_key}"
+    )
 
 # Relative volume thresholds by market cap tier.
 # Large caps require far more capital to move the volume needle, so lower thresholds apply.
@@ -368,6 +465,12 @@ def init_db(conn):
     if "metadata" not in sig_cols:
         conn.execute("ALTER TABLE signals ADD COLUMN metadata TEXT")
         print("[schema] added missing column to signals: metadata")
+    if "bullish_count" not in sig_cols:
+        conn.execute("ALTER TABLE signals ADD COLUMN bullish_count INTEGER")
+        print("[schema] added missing column to signals: bullish_count")
+    if "bearish_count" not in sig_cols:
+        conn.execute("ALTER TABLE signals ADD COLUMN bearish_count INTEGER")
+        print("[schema] added missing column to signals: bearish_count")
 
     conn.commit()
 
@@ -1017,9 +1120,9 @@ def fetch_stocktwits_stream(ticker, limit=30):
 
 
 def _parse_social(data):
-    """Extract bullish/bearish ratio and herd keyword count from a Stocktwits response.
+    """Extract bullish/bearish counts and herd keyword count from a Stocktwits response.
     Sentiment tags are self-reported by the poster, not inferred by the system.
-    Returns (post_count, bullish_pct, keyword_hits)."""
+    Returns (post_count, bullish_pct, keyword_hits, bullish_count, bearish_count)."""
     messages = data.get("messages", []) if data else []
     bullish  = 0
     bearish  = 0
@@ -1038,7 +1141,7 @@ def _parse_social(data):
             kw_hits += 1
     tagged      = bullish + bearish
     bullish_pct = bullish / tagged if tagged > 0 else None
-    return len(messages), bullish_pct, kw_hits
+    return len(messages), bullish_pct, kw_hits, bullish, bearish
 
 
 def process_social_signals(conn, tickers):
@@ -1048,14 +1151,15 @@ def process_social_signals(conn, tickers):
     now = datetime.now(timezone.utc).isoformat()
     for ticker in sorted(tickers):
         data = fetch_stocktwits_stream(ticker)
-        post_count, bullish_pct, kw_hits = _parse_social(data)
+        post_count, bullish_pct, kw_hits, bull_ct, bear_ct = _parse_social(data)
         signal_type = "social_spike" if kw_hits >= 3 else "social_read"
         conn.execute("""
             INSERT INTO signals
             (ticker, signal_type, signal_value, post_count, bullish_pct,
-             keyword_hits, detected_at)
-            VALUES (?,?,?,?,?,?,?)
-        """, (ticker, signal_type, bullish_pct, post_count, bullish_pct, kw_hits, now))
+             keyword_hits, detected_at, bullish_count, bearish_count)
+            VALUES (?,?,?,?,?,?,?,?,?)
+        """, (ticker, signal_type, bullish_pct, post_count, bullish_pct, kw_hits,
+              now, bull_ct, bear_ct))
         if signal_type == "social_spike":
             print(
                 f"   [social spike] {ticker}: {kw_hits} herd keywords "
@@ -1103,9 +1207,15 @@ def _parse_finviz_val(s):
 
 
 def fetch_finviz_unusual_volume():
-    """Fetch the Finviz Elite unusual volume screener as a list of CSV row dicts."""
+    """Fetch the Finviz Elite unusual volume screener as a list of CSV row dicts.
+    Obtains a fresh API key via login before each fetch."""
+    api_key = get_finviz_api_key()
+    if not api_key:
+        print("   [Finviz] no API key available (login failed and no static key set) -- skipping")
+        return []
+    url = _finviz_screener_url(api_key)
     try:
-        r = requests.get(FINVIZ_SCREENER_URL, headers={"User-Agent": BROWSER_UA}, timeout=15)
+        r = requests.get(url, headers={"User-Agent": BROWSER_UA}, timeout=15)
         if r.status_code != 200:
             print(f"   [Finviz] HTTP {r.status_code}")
             return []
@@ -1156,7 +1266,9 @@ def process_finviz_signals(conn):
             elif mc_clean.endswith("K"):
                 mc_m = float(mc_clean[:-1]) / 1000
             else:
-                mc_m = float(mc_clean) / 1e6
+                # v=152 export returns Market Cap as a plain number already in
+                # millions (e.g. "9626.54" = $9.6B) -- do NOT divide again.
+                mc_m = float(mc_clean)
         except (ValueError, TypeError):
             mc_m = None
 
@@ -1225,6 +1337,8 @@ def process_finviz_signals(conn):
 # ============================================================================
 
 def main():
+    global _finviz_api_key_cache
+    _finviz_api_key_cache = None  # force a fresh Finviz login each pipeline run
     pipeline_start = time.time()
     conn           = sqlite3.connect(DB_PATH)
     init_db(conn)

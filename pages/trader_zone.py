@@ -184,28 +184,42 @@ def load_ticker_articles(conn, ticker, since_iso):
     """, (ticker, since_iso)).fetchall()
 
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+def _fetch_one_snapshot(tk):
+    """Fetch a single ticker's price snapshot. Returns (ticker, data_or_None)."""
+    try:
+        fi  = yf.Ticker(tk).fast_info
+        px  = fi.last_price
+        prv = fi.previous_close
+        if px and prv:
+            return tk, {
+                "price":      round(px, 2),
+                "chg_pct":    100 * (px - prv) / prv,
+                "volume":     getattr(fi, "last_volume", None),
+                "avg_vol":    getattr(fi, "three_month_average_volume", None),
+                "market_cap": getattr(fi, "market_cap", None),
+            }
+    except Exception:
+        pass
+    return tk, None
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def load_price_snapshot(ticker_tuple):
-    """Fetch live price, change, volume, and market cap for a batch of tickers.
-    Capped at 100 tickers to avoid yfinance rate limiting. Cached 5 minutes."""
+    """Fetch live price, change, volume, and market cap for a batch of tickers
+    concurrently. Capped at 100 tickers to avoid yfinance rate limiting.
+    Cached 5 minutes. Only successful fetches are cached -- a transient yfinance
+    failure on one run won't get frozen into the cache for the full TTL."""
     result = {}
-    for tk in ticker_tuple:
-        try:
-            fi  = yf.Ticker(tk).fast_info
-            px  = fi.last_price
-            prv = fi.previous_close
-            if px and prv:
-                result[tk] = {
-                    "price":      round(px, 2),
-                    "chg_pct":    100 * (px - prv) / prv,
-                    "volume":     getattr(fi, "last_volume", None),
-                    "avg_vol":    getattr(fi, "three_month_average_volume", None),
-                    "market_cap": getattr(fi, "market_cap", None),
-                }
-        except Exception:
-            pass
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        futures = [executor.submit(_fetch_one_snapshot, tk) for tk in ticker_tuple]
+        for future in as_completed(futures):
+            tk, data = future.result()
+            if data:
+                result[tk] = data
     return result
-
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_fundamentals(ticker):
@@ -716,7 +730,8 @@ uv_tickers = {r[0] for r in conn.execute("""
       AND detected_at >= ?
 """, (uv_cutoff,)).fetchall()}
 
-price_snap    = load_price_snapshot(all_tks)
+with st.spinner(f"Loading live prices for {len(all_tks)} tickers..."):
+    price_snap = load_price_snapshot(all_tks)
 social_badges = load_social_badges(all_tks)
 signals_batch = load_all_signals_batch(all_tks, since_iso)
 show_rs       = sort_mode == "composite"
