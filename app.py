@@ -16,9 +16,10 @@ Usage:
 
 import os
 import sqlite3
-import subprocess
-import sys
 import math
+import sys
+import time
+import subprocess
 from datetime import datetime, timezone, timedelta
 
 import streamlit as st
@@ -240,7 +241,7 @@ def load_density_series(conn, ticker, since_iso):
 
 
 @st.cache_data(ttl=900)
-def load_price_data(ticker, period, interval):
+def _load_price_data_cached(ticker, period, interval):
     """Fetch historical OHLCV data from yfinance for the Ticker Chart price overlay.
     Handles both timezone-aware and timezone-naive index formats across yfinance versions."""
     try:
@@ -263,6 +264,19 @@ def load_price_data(ticker, period, interval):
     except Exception:
         return pd.DataFrame()
 
+def load_price_data(ticker, period, interval):
+    """Fetch price data with retries, and critically -- never cache an empty
+    result. A single transient Yahoo failure was previously being frozen into
+    the cache for the full 15 minutes, which made working tickers look broken."""
+    for attempt in range(3):
+        df = _load_price_data_cached(ticker, period, interval)
+        if not df.empty:
+            return df
+        # Clear the cached empty result so the retry actually re-fetches
+        _load_price_data_cached.clear()
+        if attempt < 2:
+            time.sleep(0.4)
+    return pd.DataFrame()
 
 @st.cache_data(ttl=300, show_spinner=False)
 def load_social_series(_conn, ticker, since_iso):
@@ -635,16 +649,21 @@ with tab_chart:
                 st.plotly_chart(fig, use_container_width=True)
 
                 # Summary metrics below the chart
+                tf_label = timeframe if timeframe != "Custom" else "selected range"
+                st.caption(f"All metrics below reflect the **{tf_label}** window only.")
                 scol1, scol2, scol3, scol4 = st.columns(4)
                 with scol1:
                     if has_sentiment:
-                        st.metric("Avg news sentiment", f"{sentiment_df['avg_score'].mean():+.2f}")
+                        st.metric(f"Avg news sentiment ({tf_label})",
+                                  f"{sentiment_df['avg_score'].mean():+.2f}")
                 with scol2:
                     if has_density:
-                        st.metric("Total news mentions", int(density_df["mentions"].sum()))
+                        st.metric(f"News mentions ({tf_label})",
+                                  int(density_df["mentions"].sum()))
                 with scol3:
                     if has_social:
-                        st.metric("Avg social bullish%", f"{social_df['avg_bullish_pct'].mean():.0%}")
+                        st.metric(f"Avg social bullish% ({tf_label})",
+                                  f"{social_df['avg_bullish_pct'].mean():.0%}")
                 with scol4:
                     if has_price:
                         latest   = price_df_trimmed["price"].iloc[-1]

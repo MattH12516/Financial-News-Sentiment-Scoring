@@ -4,3 +4,4 @@ articles.db-journal
 __pycache__/
 .venv/
 *.pyc
+pipeline.lock

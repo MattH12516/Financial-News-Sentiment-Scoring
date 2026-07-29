@@ -15,11 +15,11 @@ Features:
   - Currently on Unusual Volume section (Finviz data)
   - Pre-Signal Candidates watchlist (signals fired, volume not yet confirmed)
 """
-
 import os
 import sqlite3
 import math
 import sys
+import time
 import subprocess
 from datetime import datetime, timezone, timedelta
 
@@ -122,6 +122,84 @@ def time_ago(iso_str):
     except Exception:
         return ""
 
+def compute_composite(score, density, herd_hits=0, bullish_pct=None):
+    """Composite rank = sentiment x log(1 + news density) x herd multiplier.
+
+    The herd multiplier reflects that a loud, bullish retail crowd is itself a
+    driving force -- it amplifies a ticker's rank when social chatter is heavy
+    and skewed bullish, and dampens it when the crowd is heavily bearish.
+    Neutral (1.0) when there is no herd data, so tickers are never penalised
+    simply for lacking social coverage. Clamped to avoid runaway values."""
+    base = (score or 0) * math.log(1 + (density or 0))
+    if herd_hits and bullish_pct is not None:
+        # bullish_tilt: 0.0 at 50% bullish, +1.0 at 100%, -1.0 at 0%
+        bullish_tilt = (bullish_pct - 0.5) * 2
+        herd_mult    = 1 + (math.log(1 + herd_hits) / 5) * bullish_tilt
+        herd_mult    = max(0.5, min(2.0, herd_mult))
+    else:
+        herd_mult = 1.0
+    return base * herd_mult
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_herd_data(ticker_tuple, lookback_hours=24):
+    """Social herd metrics per ticker: message counts, bullish/bearish split,
+    and herd keyword hits. Feeds both the ranking formula and the row display."""
+    result = {}
+    if not ticker_tuple:
+        return result
+    try:
+        conn   = get_connection()
+        cutoff = (datetime.now(timezone.utc)
+                  - timedelta(hours=lookback_hours)).isoformat()
+        ph     = ",".join("?" for _ in ticker_tuple)
+        rows   = conn.execute(f"""
+            SELECT ticker,
+                   AVG(bullish_pct)                AS avg_bullish_pct,
+                   SUM(COALESCE(bullish_count,0))  AS bullish_ct,
+                   SUM(COALESCE(bearish_count,0))  AS bearish_ct,
+                   SUM(COALESCE(post_count,0))     AS total_posts,
+                   SUM(COALESCE(keyword_hits,0))   AS herd_hits
+            FROM   signals
+            WHERE  ticker IN ({ph})
+              AND  signal_type IN ('social_spike','social_read')
+              AND  detected_at >= ?
+            GROUP  BY ticker
+        """, (*ticker_tuple, cutoff)).fetchall()
+        for tk, avg_bp, bull_ct, bear_ct, posts, herd in rows:
+            result[tk] = {
+                "bullish_pct": avg_bp,
+                "bullish_ct":  int(bull_ct or 0),
+                "bearish_ct":  int(bear_ct or 0),
+                "total_posts": int(posts or 0),
+                "herd_hits":   int(herd or 0),
+            }
+    except Exception:
+        pass
+    return result
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_latest_relvol(ticker_tuple):
+    """Most recent relative volume reading per ticker, for ALL tickers Finviz
+    returned -- not just those that cleared their cap tier threshold."""
+    result = {}
+    if not ticker_tuple:
+        return result
+    try:
+        conn = get_connection()
+        ph   = ",".join("?" for _ in ticker_tuple)
+        rows = conn.execute(f"""
+            SELECT ticker, relvol FROM relvol_history
+            WHERE  ticker IN ({ph})
+              AND  id IN (SELECT MAX(id) FROM relvol_history GROUP BY ticker)
+        """, (*ticker_tuple,)).fetchall()
+        for tk, rv in rows:
+            if rv is not None:
+                result[tk] = rv
+    except Exception:
+        pass
+    return result
 
 def load_trader_zone(conn, since_iso, use_weighted, sort_mode="composite"):
     """Query ranked ticker data from the database.
@@ -145,13 +223,11 @@ def load_trader_zone(conn, since_iso, use_weighted, sort_mode="composite"):
         GROUP  BY tm.ticker
     """, (since_iso,)).fetchall()
 
-    if sort_mode == "composite":
-        rows = sorted(
-            rows, key=lambda r: (r[1] or 0) * math.log(1 + (r[2] or 0)), reverse=True
-        )
-    elif sort_mode == "density":
+    # Sorting happens in the caller for composite mode (needs herd data);
+    # simple modes sort here.
+    if sort_mode == "density":
         rows = sorted(rows, key=lambda r: r[2] or 0, reverse=True)
-    else:
+    elif sort_mode == "score":
         rows = sorted(rows, key=lambda r: r[1] or 0, reverse=True)
     return rows
 
@@ -360,12 +436,12 @@ def compute_signal_score(tk, news_score, signals_list):
     else:
         flags.append(("❌", "Not on Finviz unusual volume list"))
 
-    # Factor 5: Cluster of Form 4 insider filings in the last 24 hours
+    # Factor 5: Multiple large SEC Form 4 purchases filed within 24 hours
     if any(s["type"] == "form4_cluster" for s in signals_list):
         points += 1
-        flags.append(("✅", "Insider buying cluster (Form 4s)"))
+        flags.append(("✅", "Whale buying -- 3+ large purchases filed (SEC Form 4)"))
     else:
-        flags.append(("⬜", "No insider cluster"))
+        flags.append(("⬜", "No whale buying detected"))
 
     # Factor 6: Short squeeze potential -- trapped shorts amplify upward moves
     sf = fv_sig["meta"].get("short_float") if fv_sig else None
@@ -375,8 +451,6 @@ def compute_signal_score(tk, news_score, signals_list):
         flags.append(("✅", f"Squeeze setup: {sf:.1f}% short float, {sr:.1f} days to cover"))
     elif sf is not None:
         flags.append(("⬜", f"Short float {sf:.1f}% -- no squeeze setup"))
-    else:
-        flags.append(("⬜", "Short data not available"))
 
     return points, flags
 
@@ -385,7 +459,7 @@ def infer_signal_reason(signals_list, mentions=0, avg_score=None):
     """Return a short plain-English description of why this ticker is on the radar."""
     parts = []
     if any(s["type"] == "form4_cluster" for s in signals_list):
-        parts.append("insider buying cluster")
+        parts.append("whale buying")
     if any(s["type"] == "social_spike" for s in signals_list):
         parts.append("retail herd spike")
     if mentions >= 3:
@@ -604,19 +678,22 @@ conn = get_connection()
 # ============================================================================
 # CONTROLS
 # ============================================================================
-
 c1, c2, c3, c4, c5 = st.columns([1, 1, 1, 1, 2])
 
 with c1:
     window_label = st.radio(
-        "Time window", ["30 min", "1 hour", "4 hours", "24 hours"], index=1
+        "Time window", ["10 min", "30 min", "1 hour", "4 hours", "24 hours"], index=2
     )
 with c2:
     use_weighted = st.radio("Density mode", ["Raw mentions", "Weighted"]) == "Weighted"
+    ticker_filter = st.text_input(
+        "Filter ticker", placeholder="e.g. AAPL",
+        help="Show only this ticker"
+    ).strip().upper()
 with c3:
     sort_label = st.radio(
-        "Rank by", ["Composite", "Score", "Density"],
-        help="Composite = sentiment x log(1 + density)"
+        "Rank by", ["Composite", "Score", "Density", "Herd"],
+        help="Composite = sentiment x log(1 + density) x herd multiplier"
     )
     sort_mode  = sort_label.lower().split()[0]
     vol_filter = st.radio(
@@ -633,13 +710,12 @@ with c4:
         "Alert threshold", 0.0, 1.0, 0.6, 0.05,
         help="Rows with score >= this are highlighted green"
     )
-    fast_mode = st.toggle("Fast mode", help="Locks to 30 min window")
     cap_filter = st.multiselect(
         "Market cap filter",
         ["Mega $200B+", "Large $10B-$200B", "Mid $2B-$10B",
          "Small $300M-$2B", "Micro $50M-$300M", "Nano <$50M"],
         default=[],
-        help="Leave empty to show all. Select tiers to filter.",
+        help="Leave empty to show all.",
         placeholder="All sizes",
     )
 with c5:
@@ -649,27 +725,50 @@ with c5:
     )
     auto_pipeline = st.toggle(
         "Auto-run pipeline",
-        help="Fetches and scores new articles on each refresh tick"
+        help="Runs the pipeline at most once every 10 minutes, and never while "
+             "another run is still in progress."
     )
 
-if fast_mode:
-    window_label = "30 min"
 
 # ============================================================================
 # AUTO-REFRESH
 # ============================================================================
 
+AUTO_PIPELINE_MIN_INTERVAL = 600  # 10 minutes
+
+
+def _pipeline_is_running(project_dir):
+    """True if a pipeline run is in progress, based on its lock file.
+    Locks older than 20 minutes are treated as stale and cleared."""
+    lock_path = os.path.join(project_dir, "pipeline.lock")
+    if not os.path.exists(lock_path):
+        return False
+    try:
+        if (time.time() - os.path.getmtime(lock_path)) > 1200:
+            os.remove(lock_path)
+            return False
+    except Exception:
+        return False
+    return True
+
+
 if _HAS_AUTOREFRESH:
-    count    = _st_autorefresh(interval=refresh_secs * 1000, key="tz_refresh")
-    prev_key = "tz_pipeline_count"
-    # Only fire pipeline when the autorefresh counter actually increments
-    if (auto_pipeline and count > 0
-            and count != st.session_state.get(prev_key, -1)):
-        st.session_state[prev_key] = count
-        # Resolve project root so pipeline.py can be found regardless of cwd
-        _proj = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        subprocess.Popen([sys.executable, "pipeline.py"], cwd=_proj)
-        st.cache_data.clear()
+    count = _st_autorefresh(interval=refresh_secs * 1000, key="tz_refresh")
+    if auto_pipeline and count > 0:
+        _proj     = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        last_run  = st.session_state.get("tz_last_pipeline_ts", 0)
+        elapsed   = time.time() - last_run
+        if _pipeline_is_running(_proj):
+            st.caption("Auto-run: a pipeline run is already in progress -- skipping.")
+        elif elapsed < AUTO_PIPELINE_MIN_INTERVAL:
+            wait = int((AUTO_PIPELINE_MIN_INTERVAL - elapsed) / 60) + 1
+            st.caption(f"Auto-run: next eligible run in ~{wait} min "
+                       "(limited to once every 10 minutes).")
+        else:
+            st.session_state["tz_last_pipeline_ts"] = time.time()
+            subprocess.Popen([sys.executable, "pipeline.py"], cwd=_proj)
+            st.cache_data.clear()
+            st.caption("Auto-run: pipeline started.")
 else:
     st.caption("Install streamlit-autorefresh for auto-refresh support.")
 
@@ -734,7 +833,27 @@ with st.spinner(f"Loading live prices for {len(all_tks)} tickers..."):
     price_snap = load_price_snapshot(all_tks)
 social_badges = load_social_badges(all_tks)
 signals_batch = load_all_signals_batch(all_tks, since_iso)
+herd_data     = load_herd_data(all_tks)
+relvol_map    = load_latest_relvol(all_tks)
 show_rs       = sort_mode == "composite"
+
+# Composite and herd sorting need the herd data, so they sort here
+if sort_mode == "composite":
+    tz_rows = sorted(
+        tz_rows,
+        key=lambda r: compute_composite(
+            r[1], r[2],
+            herd_data.get(r[0], {}).get("herd_hits", 0),
+            herd_data.get(r[0], {}).get("bullish_pct"),
+        ),
+        reverse=True,
+    )
+elif sort_mode == "herd":
+    tz_rows = sorted(
+        tz_rows,
+        key=lambda r: herd_data.get(r[0], {}).get("herd_hits", 0),
+        reverse=True,
+    )
 
 # ============================================================================
 # COLUMN HEADERS
@@ -751,13 +870,12 @@ st.markdown(f"""
         <span style="min-width:24px;">#</span>
         <span style="min-width:58px;">Ticker</span>
         <span style="min-width:50px;">Score</span>
-        <span style="min-width:18px;">vel</span>
         <span style="flex:1;min-width:90px;">Sentiment</span>
         <span style="min-width:72px;text-align:right;">Price</span>
         <span style="min-width:62px;text-align:right;">Day chg</span>
-        <span style="min-width:18px;text-align:center;">Vol</span>
-        <span style="min-width:54px;text-align:right;">Density</span>
-        <span style="min-width:58px;text-align:right;">Social</span>
+        <span style="min-width:48px;text-align:right;">RelVol</span>
+        <span style="min-width:54px;text-align:right;">News</span>
+        <span style="min-width:88px;text-align:right;">Herd (B/S)</span>
         <span style="min-width:60px;text-align:right;">Mkt Cap</span>
         <span style="min-width:42px;text-align:right;">Signal</span>
         {rs_hdr}
@@ -778,6 +896,10 @@ for tk, score, density, raw_count in tz_rows:
     mc                           = pd_snap.get("market_cap")
     tier_key, tier_label, tier_short = get_cap_tier(mc)
 
+    # Apply ticker filter
+    if ticker_filter and ticker_filter not in tk:
+        continue
+
     # Apply market cap filter if selections were made
     if cap_filter and tier_short not in cap_filter:
         continue
@@ -796,16 +918,6 @@ for tk, score, density, raw_count in tz_rows:
                    "tz-score-neg" if score < -0.05 else "tz-score-neu")
     density_val = f"{density:.1f}" if use_weighted else str(int(density))
 
-    # Sentiment velocity arrow
-    vel = load_velocity(conn, tk, since_iso, minutes)
-    if vel is None:
-        vel_html = '<span class="tz-vel-flat">--</span>'
-    elif vel > 0.08:
-        vel_html = '<span class="tz-vel-up">↑</span>'
-    elif vel < -0.08:
-        vel_html = '<span class="tz-vel-down">↓</span>'
-    else:
-        vel_html = '<span class="tz-vel-flat">→</span>'
 
     # Live price and intraday change
     if pd_snap:
@@ -828,52 +940,50 @@ for tk, score, density, raw_count in tz_rows:
     # Alert threshold highlighting
     row_cls = "tz-alert-row" if score >= alert_threshold else "tz-row"
 
-    # Composite rank score
-    rs_html = ""
-    if show_rs:
-        rs      = score * math.log(1 + (density or 0))
-        rs_html = f'<span class="tz-rs">{rs:.3f}</span>'
-
-    # Social bullish% badge
-    sb = social_badges.get(tk, {})
-    if sb.get("bullish_pct") is not None:
-        bp          = sb["bullish_pct"]
-        sp_flag     = " (spike)" if sb.get("signal_type") == "social_spike" else ""
-        bp_color    = "#3fb950" if bp >= 0.6 else "#f85149" if bp <= 0.4 else "#8b949e"
-        social_html = (
-            f'<span style="min-width:58px;text-align:right;'
-            f'color:{bp_color};font-size:12px;font-weight:600;">'
-            f'{bp:.0%}{sp_flag}</span>'
-        )
-    else:
-        social_html = '<span style="min-width:58px;"></span>'
-
     # Six-factor signal score
     sig_list       = signals_batch.get(tk, [])
     sig_pts, flags = compute_signal_score(tk, score, sig_list)
     sig_cls        = "sig-high" if sig_pts >= 4 else "sig-med" if sig_pts >= 2 else "sig-low"
     sig_badge      = f'<span class="{sig_cls}">{sig_pts}/6</span>'
 
-    # Relvol: prefer Finviz stored value, fall back to live yfinance calculation
-    live_rv     = None
-    fv_sig_meta = next(
-        (s["meta"] for s in sig_list
-         if s["type"] in ("unusual_volume", "unusual_volume_squeeze")),
-        {}
-    )
+    
+    # Relative volume -- prefer stored Finviz value (now covers every ticker
+    # Finviz returns, not just threshold-clearing ones), fall back to a live
+    # calculation from the yfinance snapshot.
+    finviz_rv = relvol_map.get(tk)
+    live_rv   = None
     if pd_snap.get("volume") and pd_snap.get("avg_vol") and pd_snap["avg_vol"] > 0:
         live_rv = pd_snap["volume"] / pd_snap["avg_vol"]
-    finviz_rv  = fv_sig_meta.get("relvol")
     relvol_val = finviz_rv or live_rv
     if relvol_val:
         rv_color = ("#3fb950" if relvol_val >= 3 else
                     "#e3b341" if relvol_val >= 1.5 else "#6e7681")
-        rv_html  = (
-            f'<span style="color:{rv_color};font-size:11px;'
-            f'min-width:48px;text-align:right;">{relvol_val:.1f}x</span>'
-        )
+        rv_html  = (f'<span style="color:{rv_color};font-size:11px;'
+                    f'min-width:48px;text-align:right;">{relvol_val:.1f}x</span>')
     else:
         rv_html = '<span style="min-width:48px;"></span>'
+
+    # Herd: bullish/bearish message counts plus herd keyword hits
+    hd = herd_data.get(tk, {})
+    if hd.get("total_posts"):
+        bull_ct  = hd["bullish_ct"]
+        bear_ct  = hd["bearish_ct"]
+        herd_ct  = hd["herd_hits"]
+        bp       = hd.get("bullish_pct")
+        hd_color = ("#3fb950" if bp and bp >= 0.6 else
+                    "#f85149" if bp and bp <= 0.4 else "#8b949e")
+        herd_flag = f' <span style="color:#e3b341;">{herd_ct}h</span>' if herd_ct else ""
+        herd_html = (f'<span style="min-width:88px;text-align:right;font-size:11px;'
+                     f'color:{hd_color};">{bull_ct}/{bear_ct}{herd_flag}</span>')
+    else:
+        herd_html = '<span style="min-width:88px;"></span>'
+
+    # Composite rank score, now herd-aware
+    rs_html = ""
+    if show_rs:
+        rs = compute_composite(score, density, hd.get("herd_hits", 0),
+                               hd.get("bullish_pct"))
+        rs_html = f'<span class="tz-rs">{rs:.3f}</span>'
 
     # Market cap display string
     mc_html = (
@@ -887,14 +997,12 @@ for tk, score, density, raw_count in tz_rows:
             <span class="tz-rank">{rank}</span>
             <span class="tz-ticker">{tk}</span>
             <span class="{score_cls}">{score:+.2f}</span>
-            {vel_html}
             {sentiment_bar_html(score)}
             <span class="tz-price">{price_str}</span>
             <span class="{chg_cls}">{chg_str}</span>
-            {vol_html}
             {rv_html}
             <span class="tz-density">{density_val}</span>
-            {social_html}
+            {herd_html}
             {mc_html}
             {sig_badge}
             {rs_html}

@@ -64,6 +64,7 @@ except ImportError:
 # ============================================================================
 
 DB_PATH               = "articles.db"
+PIPELINE_LOCK         = "pipeline.lock"   # prevents overlapping auto-runs
 TICKERS_PATH          = "company_tickers.json"
 KEYWORDS_PATH         = "financial_keywords.csv"
 MAX_TICKERS           = 50000
@@ -1083,6 +1084,24 @@ Example: {{"AAPL": {{"is_about_ticker": true, "score": 0.7, "reasoning": "...", 
                 print(f"   [sentiment] partial recovery: {list(recovered.keys())}")
             return recovered
     except Exception as e:
+        msg = str(e)
+        # Rate limit / overload -- back off briefly and retry once rather than
+        # silently dropping the article. More likely now that scoring runs
+        # concurrently.
+        if "429" in msg or "rate_limit" in msg.lower() or "overloaded" in msg.lower():
+            time.sleep(2)
+            try:
+                response = client.messages.create(
+                    model=SCORING_MODEL,
+                    max_tokens=2048,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                raw = response.content[0].text.strip()
+                raw = re.sub(r'^```(?:json)?\s*|\s*```$', '', raw)
+                return json.loads(raw)
+            except Exception as retry_err:
+                print(f"   [sentiment] retry failed: {retry_err}")
+                return {}
         print(f"   [sentiment] error: {e}")
         return {}
 
@@ -1280,8 +1299,18 @@ def process_finviz_signals(conn):
         if rv and rv > 100:
             continue
 
-        # Apply tiered threshold -- skip if relvol does not meet the bar for this cap tier
         tier_label, tier_display, relvol_min = _cap_tier(mc_m)
+
+        # Record relvol for EVERY ticker Finviz returns, even those below their
+        # tier threshold. This lets the dashboard show real relative volume for
+        # any ticker and spot names with signals firing that have not yet moved.
+        if rv:
+            conn.execute(
+                "INSERT INTO relvol_history (ticker, relvol, snapshot_at) VALUES (?,?,?)",
+                (ticker, rv, now)
+            )
+
+        # Only write an unusual_volume signal if it clears its cap tier threshold
         if rv is None or rv < relvol_min:
             continue
 
@@ -1312,13 +1341,6 @@ def process_finviz_signals(conn):
             VALUES (?,?,?,?,?,?,?,?)
         """, (ticker, sig_type, rv, 0, None, int(sf) if sf else 0, now, meta))
 
-        # Record relvol snapshot for trend analysis over time
-        if rv:
-            conn.execute(
-                "INSERT INTO relvol_history (ticker, relvol, snapshot_at) VALUES (?,?,?)",
-                (ticker, rv, now)
-            )
-
         if squeeze:
             print(
                 f"   [Finviz] squeeze setup: {ticker} "
@@ -1339,6 +1361,15 @@ def process_finviz_signals(conn):
 def main():
     global _finviz_api_key_cache
     _finviz_api_key_cache = None  # force a fresh Finviz login each pipeline run
+
+    # Lock file lets the dashboard detect an in-progress run and refuse to
+    # start another on top of it.
+    try:
+        with open(PIPELINE_LOCK, "w") as f:
+            f.write(str(time.time()))
+    except Exception:
+        pass
+
     pipeline_start = time.time()
     conn           = sqlite3.connect(DB_PATH)
     init_db(conn)
@@ -1502,16 +1533,16 @@ def main():
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             fetched = list(executor.map(_fetch_api_body, new_items))
 
+        # --- Prepare scoring jobs -------------------------------------------
+        scoring_jobs = []
         for item, dedup_key, body in fetched:
             title     = item.get("title", "")
-            # Provider name comes pre-packaged in the API response -- no parsing needed
             source    = item.get("provider", {}).get("name", "TradingView")
             pub_ts    = item.get("published", 0)
             published = (
                 datetime.fromtimestamp(pub_ts, tz=timezone.utc).isoformat()
                 if pub_ts else ""
             )
-
             if not title:
                 continue
             if body:
@@ -1519,25 +1550,44 @@ def main():
             new_c += 1
             source_stats[source]["total"] += 1
 
-            # TradingView's relatedSymbols are exchange-validated -- use as primary ticker source
             api_tickers   = _symbols_from_api(item.get("relatedSymbols", []), watchlist)
             title_tickers = match_tickers(title, watchlist)
 
-            # API tickers or title match bypass the keyword gate -- article is clearly relevant
             if not api_tickers and not title_tickers and not passes_keyword_filter(
                     title, keywords):
                 save_article(conn, link=dedup_key, title=title, summary="", body=None,
                              source=source, published=published, tickers=set(),
-                             form_type=None, scores={}, keyword_passed=0, wire_source=source)
+                             form_type=None, scores={}, keyword_passed=0,
+                             wire_source=source)
                 continue
 
             if not is_english(title or (body or "")[:200]):
                 continue
 
-            # Combine API symbols with our own name/ticker matching for maximum coverage
             tickers = api_tickers | match_tickers(f"{title} {body or ''}", watchlist)
+            scoring_jobs.append({
+                "dedup_key": dedup_key, "title": title, "body": body,
+                "source": source, "published": published, "tickers": tickers,
+            })
 
-            ai_results = score_article(title, body or "", tickers)
+        # --- Score concurrently ---------------------------------------------
+        # Each LLM call is network-bound, so running them in parallel cuts this
+        # phase from minutes to well under a minute on large catch-up runs.
+        def _score_job(job):
+            job["ai_results"] = score_article(
+                job["title"], job["body"] or "", job["tickers"]
+            )
+            return job
+
+        if scoring_jobs:
+            print(f"   scoring {len(scoring_jobs)} articles concurrently...")
+            with ThreadPoolExecutor(max_workers=16) as executor:
+                scoring_jobs = list(executor.map(_score_job, scoring_jobs))
+
+        # --- Save results ----------------------------------------------------
+        for job in scoring_jobs:
+            ai_results = job["ai_results"]
+            tickers    = job["tickers"]
             if ai_results:
                 confirmed    = {
                     tk for tk in tickers
@@ -1545,19 +1595,20 @@ def main():
                 }
                 save_tickers = confirmed
                 scores       = {tk: ai_results[tk] for tk in confirmed}
-                weights      = {tk: ai_results[tk].get("prominence", 1.0) for tk in confirmed}
+                weights      = {tk: ai_results[tk].get("prominence", 1.0)
+                                for tk in confirmed}
             else:
                 save_tickers, scores, weights = tickers, {}, {}
 
             if save_tickers:
                 match_c += 1
-                source_stats[source]["matched"] += 1
+                source_stats[job["source"]]["matched"] += 1
 
-            save_article(conn, link=dedup_key, title=title, summary="",
-                         body=body if save_tickers else None, source=source,
-                         published=published, tickers=save_tickers, form_type=None,
-                         scores=scores, wire_source=source, weights=weights)
-
+            save_article(conn, link=job["dedup_key"], title=job["title"], summary="",
+                         body=job["body"] if save_tickers else None,
+                         source=job["source"], published=job["published"],
+                         tickers=save_tickers, form_type=None,
+                         scores=scores, wire_source=job["source"], weights=weights)
     conn.commit()
     print(
         f"   {new_c} new, {match_c} matched, {body_c} bodies  "
@@ -1588,6 +1639,12 @@ def main():
     process_finviz_signals(conn)
 
     print(f"\n[pipeline] done in {time.time() - pipeline_start:.1f}s")
+
+    try:
+        if os.path.exists(PIPELINE_LOCK):
+            os.remove(PIPELINE_LOCK)
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
