@@ -41,13 +41,19 @@ st.markdown("""
 <style>
     .stApp { background-color: #0e1117; }
 
-    /* Wider scrollbars -- easier to grab and drag without a scroll wheel */
+    /* Navigation lives in the app's own tabs and links, not the sidebar */
+    [data-testid="stSidebarNav"] { display: none; }
+
+    /* Wider scrollbars -- easier to grab without a scroll wheel */
     ::-webkit-scrollbar { width: 18px; height: 18px; }
     ::-webkit-scrollbar-track { background: #0e1117; }
     ::-webkit-scrollbar-thumb {
         background: #3d444d; border-radius: 9px; border: 3px solid #0e1117;
     }
     ::-webkit-scrollbar-thumb:hover { background: #58a6ff; }
+
+    /* Wide enough for an absolute timestamp without wrapping */
+    .article-time { color: #6e7681; min-width: 112px; white-space: nowrap; }
 
     /* News Feed article row */
     .article-row {
@@ -846,3 +852,5 @@ with tab_trader:
     st.markdown("<br>", unsafe_allow_html=True)
     # URL is dynamic -- uses Railway public domain in production, localhost in development
     st.link_button("Open Trader Zone", url=f"{_base_url}/trader_zone")
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.link_button("Company Deep Dive", url=f"{_base_url}/company_deep_dive")

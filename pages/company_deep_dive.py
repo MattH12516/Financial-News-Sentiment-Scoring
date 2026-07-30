@@ -40,6 +40,9 @@ st.markdown("""
     /* Navigation lives in the app's own tabs and links, not the sidebar */
     [data-testid="stSidebarNav"] { display: none; }
 
+    /* Navigation lives in the app's own tabs and links, not the sidebar */
+    [data-testid="stSidebarNav"] { display: none; }
+
     /* Wider scrollbars -- easier to grab without a scroll wheel */
     ::-webkit-scrollbar { width: 18px; height: 18px; }
     ::-webkit-scrollbar-track { background: #0e1117; }
