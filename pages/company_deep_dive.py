@@ -37,6 +37,9 @@ st.markdown("""
 <style>
     .stApp { background-color: #0e1117; }
 
+    /* Navigation lives in the app's own tabs and links, not the sidebar */
+    [data-testid="stSidebarNav"] { display: none; }
+
     /* Wider scrollbars -- easier to grab without a scroll wheel */
     ::-webkit-scrollbar { width: 18px; height: 18px; }
     ::-webkit-scrollbar-track { background: #0e1117; }
@@ -430,21 +433,14 @@ on_vol_list = any(
 )
 has_whale = any(s["type"] == "form4_cluster" for s in sigs)
 
-s1, s2, s3, s4 = st.columns(4)
+s1, s2, s3 = st.columns(3)
 with s1:
     st.metric(
         "Relative volume",
         f"{relvol:.1f}x" if relvol else "--",
-        help=f"This tier is flagged as unusual at {threshold}x or above."
+        help="Today's trading volume compared to this stock's normal volume."
     )
 with s2:
-    st.metric(
-        "Unusual volume threshold",
-        f"{threshold}x",
-        help="Larger companies need less relative movement to represent "
-             "meaningful dollar flow, so thresholds scale with market cap."
-    )
-with s3:
     st.metric(
         "Social (24h)",
         f"{herd['bullish_pct']:.0%} bull" if herd.get("bullish_pct") is not None else "--",
@@ -452,38 +448,29 @@ with s3:
               f"messages, {herd.get('herd_hits',0)} herd keyword hits")
         if herd else "No social data recorded in the last 24h"
     )
-with s4:
-    st.metric("Whale buying (48h)", "Yes" if has_whale else "No",
-              help="3+ SEC Form 4 insider purchases filed within 24 hours")
+with s3:
+    st.metric("Whale buying", "Yes" if has_whale else "No",
+              help="A cluster of 3+ SEC Form 4 insider purchases filed within a "
+                   "24-hour period, detected at any point in the last 48 hours")
 
 # Plain-language status read
 if on_vol_list:
     st.success(
-        f"**Confirmed by volume.** {ticker} is on the Finviz unusual volume list "
-        f"at {relvol:.1f}x, above the {threshold}x threshold for its size tier."
-        if relvol else
-        f"**Confirmed by volume.** {ticker} is on the Finviz unusual volume list."
+        f"**Confirmed by volume.** {ticker} appeared on the Finviz unusual volume "
+        f"screener" + (f" at {relvol:.1f}x relative volume." if relvol else ".")
     )
 elif relvol is not None:
-    gap = threshold - relvol
     if herd.get("total_posts") or sigs:
         st.warning(
-            f"**Pre-signal candidate.** Signals are present but volume has not "
-            f"confirmed -- {ticker} is at {relvol:.1f}x, "
-            f"{gap:.1f}x below the {threshold}x threshold for a {tier_lbl.split('(')[0].strip().lower()}. "
-            "This is the early-stage case: the herd has moved, the market has not."
+            f"**Signals present, volume not yet elevated.** {ticker} is trading at "
+            f"{relvol:.1f}x its normal volume. News or social activity has been "
+            "recorded, but the market has not moved unusually yet."
         )
     else:
-        st.info(
-            f"{ticker} is at {relvol:.1f}x relative volume, below the "
-            f"{threshold}x threshold for its size tier, with no other signals recorded."
-        )
+        st.info(f"{ticker} is trading at {relvol:.1f}x normal volume, with no "
+                "news or social signals recorded.")
 else:
-    st.info(
-        f"No Finviz relative volume reading recorded for {ticker}. It may not "
-        "have appeared in a recent screener pull -- run the pipeline to refresh."
-    )
-
+    st.info(f"No relative volume reading recorded for {ticker} yet.")
 # ============================================================================
 # CHART
 # ============================================================================
