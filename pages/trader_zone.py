@@ -723,6 +723,13 @@ def sentiment_bar_html(score):
 # PAGE HEADER
 # ============================================================================
 
+nav1, nav2, _ = st.columns([1, 1, 4])
+with nav1:
+    st.page_link("app.py", label="Back to SentiFeed", icon=":material/arrow_back:")
+with nav2:
+    st.page_link("pages/company_deep_dive.py", label="Company Deep Dive",
+                 icon=":material/search:")
+
 st.markdown("## Trader Zone")
 
 conn = get_connection()
@@ -1073,7 +1080,7 @@ with tab_rank:
         st.markdown(f"""
             <div class="{row_cls}">
                 <span class="tz-rank">{rank}</span>
-                <span class="tz-ticker"><a href="/company_deep_dive?ticker={tk}" target="_blank"
+                <span class="tz-ticker"><a href="/company_deep_dive?ticker={tk}" target="_self"
                     style="color:#58a6ff;text-decoration:none;">{tk}</a></span>
                 <span class="{score_cls}">{score:+.2f}</span>
                 {sentiment_bar_html(score)}

@@ -851,6 +851,7 @@ with tab_trader:
     )
     st.markdown("<br>", unsafe_allow_html=True)
     # URL is dynamic -- uses Railway public domain in production, localhost in development
-    st.link_button("Open Trader Zone", url=f"{_base_url}/trader_zone")
+    st.page_link("pages/trader_zone.py", label="Open Trader Zone", icon=":material/table_chart:")
+    st.page_link("pages/company_deep_dive.py", label="Company Deep Dive", icon=":material/search:")
     st.markdown("<br>", unsafe_allow_html=True)
     st.link_button("Company Deep Dive", url=f"{_base_url}/company_deep_dive")

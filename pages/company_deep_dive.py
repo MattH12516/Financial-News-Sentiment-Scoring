@@ -356,7 +356,14 @@ def load_recent_signals(conn, ticker, hours=48):
 # TICKER SELECTION
 # ============================================================================
 
-st.markdown("## Ticker Detail")
+nav1, nav2, _ = st.columns([1, 1, 4])
+with nav1:
+    st.page_link("app.py", label="Back to SentiFeed", icon=":material/arrow_back:")
+with nav2:
+    st.page_link("pages/trader_zone.py", label="Trader Zone",
+                 icon=":material/table_chart:")
+
+st.markdown("## Company Deep Dive")
 
 # Support /ticker?ticker=AAPL so Trader Zone rows can link straight here
 _qp = st.query_params
