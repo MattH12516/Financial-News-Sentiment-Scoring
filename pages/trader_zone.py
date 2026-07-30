@@ -33,6 +33,7 @@ try:
 except ImportError:
     _HAS_AUTOREFRESH = False
 
+from app import EASTERN
 import pipeline
 
 st.set_page_config(
@@ -45,6 +46,14 @@ st.set_page_config(
 st.markdown("""
 <style>
     .stApp { background-color: #0e1117; }
+
+    /* Wider scrollbars -- easier to grab and drag without a scroll wheel */
+    ::-webkit-scrollbar { width: 18px; height: 18px; }
+    ::-webkit-scrollbar-track { background: #0e1117; }
+    ::-webkit-scrollbar-thumb {
+        background: #3d444d; border-radius: 9px; border: 3px solid #0e1117;
+    }
+    ::-webkit-scrollbar-thumb:hover { background: #58a6ff; }
 
     /* Standard ticker row */
     .tz-row {
@@ -105,7 +114,20 @@ def get_connection():
     """Return a SQLite connection to the pipeline database."""
     return sqlite3.connect(pipeline.DB_PATH, check_same_thread=False)
 
-
+def fmt_time(iso_str):
+    """Absolute Eastern 12-hour timestamp, e.g. '5:07 PM Jul 29'."""
+    if not iso_str:
+        return ""
+    try:
+        dt = datetime.fromisoformat(iso_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.astimezone(EASTERN)
+        hour = dt.strftime("%I").lstrip("0") or "12"
+        return f"{hour}:{dt.strftime('%M %p %b %d')}"
+    except Exception:
+        return ""
+    
 def time_ago(iso_str):
     """Convert an ISO timestamp to a human-readable relative time string."""
     if not iso_str:
@@ -252,7 +274,8 @@ def load_velocity(conn, ticker, since_iso, window_minutes):
 def load_ticker_articles(conn, ticker, since_iso):
     """Return the 8 most recent articles mentioning a ticker within the time window."""
     return conn.execute("""
-        SELECT a.title, a.link, a.source, a.ingested_at, tm.score, tm.reasoning
+        SELECT a.title, a.link, a.source,
+               COALESCE(NULLIF(a.published, ''), a.ingested_at), tm.score, tm.reasoning
         FROM   ticker_mentions tm
         JOIN   articles a ON a.id = tm.article_id
         WHERE  tm.ticker=? AND tm.mentioned_at>=?
@@ -313,7 +336,17 @@ def load_fundamentals(ticker):
         }
     except Exception:
         return {}
-
+    
+def _fmt_num(val, fmt="{:.1f}"):
+    """Format a possibly-string numeric value from yfinance safely.
+    yfinance occasionally returns strings where floats are expected, which
+    crashes f-string numeric formatting and kills the whole page render."""
+    if val is None or val == "":
+        return "--"
+    try:
+        return fmt.format(float(val))
+    except (ValueError, TypeError):
+        return str(val)
 
 def fmt_market_cap(mc):
     """Format a market cap in dollars to a short human-readable string."""
@@ -1027,7 +1060,8 @@ for tk, score, density, raw_count in tz_rows:
     st.markdown(f"""
         <div class="{row_cls}">
             <span class="tz-rank">{rank}</span>
-            <span class="tz-ticker">{tk}</span>
+            <span class="tz-ticker"><a href="/ticker?ticker={tk}" target="_blank"
+                style="color:#58a6ff;text-decoration:none;">{tk}</a></span>
             <span class="{score_cls}">{score:+.2f}</span>
             {sentiment_bar_html(score)}
             <span class="tz-price">{price_str}</span>
@@ -1081,11 +1115,7 @@ for tk, score, density, raw_count in tz_rows:
              if s["type"] in ("unusual_volume", "unusual_volume_squeeze")),
             None
         )
-        if fv_sig and fv_sig["meta"].get("news_title"):
-            news_url = fv_sig["meta"].get("news_url", "#")
-            st.markdown(
-                f'**Finviz news:** [{fv_sig["meta"]["news_title"]}]({news_url})'
-            )
+        
 
         st.divider()
 
@@ -1093,32 +1123,27 @@ for tk, score, density, raw_count in tz_rows:
         if any(fund.values()):
             f1, f2, f3, f4, f5 = st.columns(5)
             with f1:
-                fwd_pe = fund.get("fwd_pe")
                 st.markdown(
                     f'<span class="fund-label">Forward P/E</span>'
-                    f'<span class="fund-value">'
-                    f'{f"{fwd_pe:.1f}" if fwd_pe else "--"}</span>',
+                    f'<span class="fund-value">{_fmt_num(fund.get("fwd_pe"))}</span>',
                     unsafe_allow_html=True
                 )
             with f2:
-                pe = fund.get("pe")
                 st.markdown(
                     f'<span class="fund-label">P/E (TTM)</span>'
-                    f'<span class="fund-value">{f"{pe:.1f}" if pe else "--"}</span>',
+                    f'<span class="fund-value">{_fmt_num(fund.get("pe"))}</span>',
                     unsafe_allow_html=True
                 )
             with f3:
-                beta = fund.get("beta")
                 st.markdown(
                     f'<span class="fund-label">Beta</span>'
-                    f'<span class="fund-value">{f"{beta:.2f}" if beta else "--"}</span>',
+                    f'<span class="fund-value">{_fmt_num(fund.get("beta"), "{:.2f}")}</span>',
                     unsafe_allow_html=True
                 )
             with f4:
-                sf = fund.get("short_float")
                 st.markdown(
                     f'<span class="fund-label">Short float</span>'
-                    f'<span class="fund-value">{f"{sf:.1%}" if sf else "--"}</span>',
+                    f'<span class="fund-value">{_fmt_num(fund.get("short_float"), "{:.1%}")}</span>',
                     unsafe_allow_html=True
                 )
             with f5:
@@ -1139,7 +1164,7 @@ for tk, score, density, raw_count in tz_rows:
                 st.markdown(f"""
                     <div style="padding:7px 0;border-bottom:1px solid #1c1f26;">
                         <span class="tz-article-meta">
-                            {time_ago(ingested_at)} &nbsp;·&nbsp; {source}
+                            {fmt_time(ingested_at)} &nbsp;·&nbsp; {source}
                             &nbsp;·&nbsp;
                             <span style="color:{sc_color};font-weight:700;">{sc_str}</span>
                         </span><br>

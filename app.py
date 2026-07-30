@@ -41,12 +41,20 @@ st.markdown("""
 <style>
     .stApp { background-color: #0e1117; }
 
+    /* Wider scrollbars -- easier to grab and drag without a scroll wheel */
+    ::-webkit-scrollbar { width: 18px; height: 18px; }
+    ::-webkit-scrollbar-track { background: #0e1117; }
+    ::-webkit-scrollbar-thumb {
+        background: #3d444d; border-radius: 9px; border: 3px solid #0e1117;
+    }
+    ::-webkit-scrollbar-thumb:hover { background: #58a6ff; }
+
     /* News Feed article row */
     .article-row {
         padding: 11px 14px; border-bottom: 1px solid #262730;
         display: flex; align-items: center; gap: 12px; font-size: 15px;
     }
-    .article-time   { color: #6e7681; min-width: 40px; }
+    min-width: 112px; white-space: nowrap;
     .article-source {
         background: #1c1f26; color: #8b949e; padding: 2px 8px;
         border-radius: 4px; font-size: 11px; min-width: 100px;
@@ -107,7 +115,20 @@ def scale_marker_sizes(counts, min_size=6, max_size=22):
     scaled = min_size + (counts - counts.min()) / (counts.max() - counts.min()) * (max_size - min_size)
     return scaled.tolist()
 
-
+def fmt_time(iso_str):
+    """Absolute Eastern 12-hour timestamp, e.g. '5:07 PM Jul 29'."""
+    if not iso_str:
+        return ""
+    try:
+        dt = datetime.fromisoformat(iso_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.astimezone(EASTERN)
+        hour = dt.strftime("%I").lstrip("0") or "12"
+        return f"{hour}:{dt.strftime('%M %p %b %d')}"
+    except Exception:
+        return "" 
+    
 def get_connection():
     """Return a SQLite connection to the pipeline database."""
     return sqlite3.connect(pipeline.DB_PATH, check_same_thread=False)
@@ -428,7 +449,7 @@ with tab_feed:
             )
             st.markdown(f"""
                 <div class="article-row">
-                    <span class="article-time">{time_ago(row['published'] or row['ingested_at'])}</span>
+                    <span class="article-time">{fmt_time(row['published'] or row['ingested_at'])}</span>
                     <span class="article-source">{row['source']}</span>
                     {tickers_html}
                     <a class="article-title" href="{row['link']}" target="_blank">{row['title']}</a>
