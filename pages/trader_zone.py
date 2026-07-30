@@ -12,8 +12,12 @@ Features:
   - Alert threshold row highlighting
   - Six-factor signal scoring (0-6)
   - Drill-down: signal breakdown, relvol trend, fundamentals, articles
-  - Currently on Unusual Volume section (Finviz data)
-  - Pre-Signal Candidates watchlist (signals fired, volume not yet confirmed)
+
+Single ranked view. The unusual-volume and pre-signal tabs were removed --
+both were filtered views of data already on the ranked list (RelVol column,
+signal score, and the pre-volume / why-on-radar line in each drill-down).
+The loaders load_unusual_volume_now() and load_pre_signal_candidates() are
+retained but currently uncalled.
 """
 import os
 import sqlite3
@@ -179,17 +183,21 @@ def load_herd_data(ticker_tuple, lookback_hours=24):
                   - timedelta(hours=lookback_hours)).isoformat()
         ph     = ",".join("?" for _ in ticker_tuple)
         rows   = conn.execute(f"""
-            SELECT ticker,
-                   AVG(bullish_pct)                AS avg_bullish_pct,
-                   SUM(COALESCE(bullish_count,0))  AS bullish_ct,
-                   SUM(COALESCE(bearish_count,0))  AS bearish_ct,
-                   SUM(COALESCE(post_count,0))     AS total_posts,
-                   SUM(COALESCE(keyword_hits,0))   AS herd_hits
-            FROM   signals
-            WHERE  ticker IN ({ph})
-              AND  signal_type IN ('social_spike','social_read')
-              AND  detected_at >= ?
-            GROUP  BY ticker
+            SELECT s.ticker,
+                   s.bullish_pct                AS avg_bullish_pct,
+                   COALESCE(s.bullish_count,0)  AS bullish_ct,
+                   COALESCE(s.bearish_count,0)  AS bearish_ct,
+                   COALESCE(s.post_count,0)     AS total_posts,
+                   COALESCE(s.keyword_hits,0)   AS herd_hits
+            FROM   signals s
+            JOIN  (SELECT ticker, MAX(detected_at) AS latest
+                   FROM   signals
+                   WHERE  ticker IN ({ph})
+                     AND  signal_type IN ('social_spike','social_read')
+                     AND  detected_at >= ?
+                   GROUP  BY ticker) m
+              ON   m.ticker = s.ticker AND m.latest = s.detected_at
+            WHERE  s.signal_type IN ('social_spike','social_read')
         """, (*ticker_tuple, cutoff)).fetchall()
         for tk, avg_bp, bull_ct, bear_ct, posts, herd in rows:
             result[tk] = {
@@ -920,508 +928,281 @@ elif sort_mode == "herd":
     )
 
 # ============================================================================
-# TABS -- ranked list, unusual volume, and pre-signal candidates each get
-# their own tab so none of them requires scrolling past the others.
+# COLUMN HEADERS
 # ============================================================================
 
-tab_rank, tab_vol, tab_pre = st.tabs([
-    "Ranked List", "On Unusual Volume", "Pre-Signal Candidates"
-])
+rs_hdr = (
+    '<span style="min-width:54px;text-align:right;color:#6e7681;font-size:12px;">'
+    'Rank score</span>'
+    if show_rs else ""
+)
+st.markdown(f"""
+    <div style="padding:6px 14px;display:flex;gap:12px;
+                border-bottom:1px solid #3d444d;color:#6e7681;font-size:12px;">
+        <span style="min-width:24px;">#</span>
+        <span style="min-width:58px;">Ticker</span>
+        <span style="min-width:50px;">Score</span>
+        <span style="flex:1;min-width:90px;">Sentiment</span>
+        <span style="min-width:72px;text-align:right;">Price</span>
+        <span style="min-width:62px;text-align:right;">Day chg</span>
+        <span style="min-width:48px;text-align:right;">RelVol</span>
+        <span style="min-width:54px;text-align:right;">News</span>
+        <span style="min-width:88px;text-align:right;" title="Bullish/bearish message counts and herd keyword hits in the selected window">Herd {herd_window_lbl} (B/S)</span>
+        <span style="min-width:60px;text-align:right;">Mkt Cap</span>
+        <span style="min-width:42px;text-align:right;">Signal</span>
+        {rs_hdr}
+    </div>
+""", unsafe_allow_html=True)
 
-with tab_rank:
-    # ============================================================================
-    # COLUMN HEADERS
-    # ============================================================================
+# ============================================================================
+# TICKER ROWS
+# ============================================================================
 
-    rs_hdr = (
-        '<span style="min-width:54px;text-align:right;color:#6e7681;font-size:12px;">'
-        'Rank score</span>'
-        if show_rs else ""
+display_rank = 0
+for tk, score, density, raw_count in tz_rows:
+    if score is None:
+        continue
+
+    # Market cap and tier from yfinance snapshot
+    pd_snap                      = price_snap.get(tk, {})
+    mc                           = pd_snap.get("market_cap")
+    tier_key, tier_label, tier_short = get_cap_tier(mc)
+
+    # Apply ticker filter
+    if ticker_filter and ticker_filter not in tk:
+        continue
+
+    # Apply market cap filter if selections were made
+    if cap_filter and tier_short not in cap_filter:
+        continue
+
+    # Apply volume filter
+    on_vol_list = tk in uv_tickers
+    if vol_filter == "On volume list" and not on_vol_list:
+        continue
+    if vol_filter == "Pre-signal only" and on_vol_list:
+        continue
+
+    display_rank += 1
+    rank = display_rank
+
+    score_cls   = ("tz-score-pos" if score > 0.05 else
+                   "tz-score-neg" if score < -0.05 else "tz-score-neu")
+    density_val = f"{density:.1f}" if use_weighted else str(int(density))
+
+
+    # Live price and intraday change
+    if pd_snap:
+        price_str = f"${pd_snap['price']:.2f}"
+        chg       = pd_snap["chg_pct"]
+        chg_cls   = ("tz-chg-pos" if chg > 0 else
+                     "tz-chg-neg" if chg < 0 else "tz-chg-neu")
+        chg_str   = f"{chg:+.2f}%"
+    else:
+        price_str = "--"
+        chg_cls   = "tz-chg-neu"
+        chg_str   = "--"
+
+    # Unusual volume flag -- fires if current volume is on pace to exceed 3-month average
+    vol_html = '<span style="min-width:18px;"></span>'
+    if pd_snap.get("volume") and pd_snap.get("avg_vol") and pd_snap["avg_vol"] > 0:
+        if pd_snap["volume"] > pd_snap["avg_vol"] * 0.5:
+            vol_html = '<span class="tz-vol-flag" title="Unusual volume">🔥</span>'
+
+    # Alert threshold highlighting
+    row_cls = "tz-alert-row" if score >= alert_threshold else "tz-row"
+
+    # Six-factor signal score
+    sig_list       = signals_batch.get(tk, [])
+    sig_pts, flags = compute_signal_score(tk, score, sig_list, herd_data.get(tk, {}))
+    sig_cls        = "sig-high" if sig_pts >= 4 else "sig-med" if sig_pts >= 2 else "sig-low"
+    sig_badge      = f'<span class="{sig_cls}">{sig_pts}/6</span>'
+
+
+    # Relative volume -- prefer stored Finviz value (now covers every ticker
+    # Finviz returns, not just threshold-clearing ones), fall back to a live
+    # calculation from the yfinance snapshot.
+    finviz_rv = relvol_map.get(tk)
+    live_rv   = None
+    if pd_snap.get("volume") and pd_snap.get("avg_vol") and pd_snap["avg_vol"] > 0:
+        live_rv = pd_snap["volume"] / pd_snap["avg_vol"]
+    # Finviz and yfinance compute relvol differently, so mark which source this
+    # came from -- a yfinance-derived figure will not correspond to the Finviz
+    # unusual volume list, which is why a high "~" value may not appear there.
+    relvol_val = finviz_rv if finviz_rv else live_rv
+    if relvol_val:
+        is_finviz = finviz_rv is not None
+        rv_color  = ("#3fb950" if relvol_val >= 3 else
+                     "#e3b341" if relvol_val >= 1.5 else "#6e7681")
+        prefix    = "" if is_finviz else "~"
+        title     = ("Finviz relative volume" if is_finviz
+                     else "Estimated from yfinance -- not a Finviz figure, "
+                          "so it will not match the unusual volume list")
+        rv_html   = (f'<span title="{title}" style="color:{rv_color};font-size:11px;'
+                     f'min-width:48px;text-align:right;">{prefix}{relvol_val:.1f}x</span>')
+    else:
+        rv_html = '<span style="min-width:48px;"></span>'
+
+    # Herd: bullish/bearish message counts plus herd keyword hits
+    hd = herd_data.get(tk, {})
+    if hd.get("total_posts"):
+        bull_ct  = hd["bullish_ct"]
+        bear_ct  = hd["bearish_ct"]
+        herd_ct  = hd["herd_hits"]
+        bp       = hd.get("bullish_pct")
+        hd_color = ("#3fb950" if bp and bp >= 0.6 else
+                    "#f85149" if bp and bp <= 0.4 else "#8b949e")
+        herd_flag = (f' <span style="color:#e3b341;">+{herd_ct}</span>'
+                     if herd_ct else "")
+        herd_html = (f'<span title="Last {herd_window_lbl}: {bull_ct} bullish / '
+                     f'{bear_ct} bearish messages, {herd_ct} herd keyword hits" '
+                     f'style="min-width:88px;text-align:right;font-size:11px;'
+                     f'color:{hd_color};">{bull_ct}/{bear_ct}{herd_flag}</span>')
+    else:
+        herd_html = '<span style="min-width:88px;"></span>'
+
+    # Composite rank score, now herd-aware
+    rs_html = ""
+    if show_rs:
+        rs = compute_composite(score, density, hd.get("herd_hits", 0),
+                               hd.get("bullish_pct"))
+        rs_html = f'<span class="tz-rs">{rs:.3f}</span>'
+
+    # Market cap display string
+    mc_html = (
+        f'<span style="color:#6e7681;font-size:11px;'
+        f'min-width:60px;text-align:right;">'
+        f'{tier_short} {fmt_mc(mc)}</span>'
     )
+
     st.markdown(f"""
-        <div style="padding:6px 14px;display:flex;gap:12px;
-                    border-bottom:1px solid #3d444d;color:#6e7681;font-size:12px;">
-            <span style="min-width:24px;">#</span>
-            <span style="min-width:58px;">Ticker</span>
-            <span style="min-width:50px;">Score</span>
-            <span style="flex:1;min-width:90px;">Sentiment</span>
-            <span style="min-width:72px;text-align:right;">Price</span>
-            <span style="min-width:62px;text-align:right;">Day chg</span>
-            <span style="min-width:48px;text-align:right;">RelVol</span>
-            <span style="min-width:54px;text-align:right;">News</span>
-            <span style="min-width:88px;text-align:right;" title="Bullish/bearish message counts and herd keyword hits in the selected window">Herd {herd_window_lbl} (B/S)</span>
-            <span style="min-width:60px;text-align:right;">Mkt Cap</span>
-            <span style="min-width:42px;text-align:right;">Signal</span>
-            {rs_hdr}
+        <div class="{row_cls}">
+            <span class="tz-rank">{rank}</span>
+            <span class="tz-ticker"><a href="/company_deep_dive?ticker={tk}" target="_self"
+                style="color:#58a6ff;text-decoration:none;">{tk}</a></span>
+            <span class="{score_cls}">{score:+.2f}</span>
+            {sentiment_bar_html(score)}
+            <span class="tz-price">{price_str}</span>
+            <span class="{chg_cls}">{chg_str}</span>
+            {rv_html}
+            <span class="tz-density">{density_val}</span>
+            {herd_html}
+            {mc_html}
+            {sig_badge}
+            {rs_html}
         </div>
     """, unsafe_allow_html=True)
 
-    # ============================================================================
-    # TICKER ROWS
-    # ============================================================================
+    # ── Drill-down expander ────────────────────────────────────────────────────
+    articles = load_ticker_articles(conn, tk, since_iso)
+    with st.expander(f"  {tk} -- fundamentals + articles"):
 
-    display_rank = 0
-    for tk, score, density, raw_count in tz_rows:
-        if score is None:
-            continue
-
-        # Market cap and tier from yfinance snapshot
-        pd_snap                      = price_snap.get(tk, {})
-        mc                           = pd_snap.get("market_cap")
-        tier_key, tier_label, tier_short = get_cap_tier(mc)
-
-        # Apply ticker filter
-        if ticker_filter and ticker_filter not in tk:
-            continue
-
-        # Apply market cap filter if selections were made
-        if cap_filter and tier_short not in cap_filter:
-            continue
-
-        # Apply volume filter
-        on_vol_list = tk in uv_tickers
-        if vol_filter == "On volume list" and not on_vol_list:
-            continue
-        if vol_filter == "Pre-signal only" and on_vol_list:
-            continue
-
-        display_rank += 1
-        rank = display_rank
-
-        score_cls   = ("tz-score-pos" if score > 0.05 else
-                       "tz-score-neg" if score < -0.05 else "tz-score-neu")
-        density_val = f"{density:.1f}" if use_weighted else str(int(density))
-
-
-        # Live price and intraday change
-        if pd_snap:
-            price_str = f"${pd_snap['price']:.2f}"
-            chg       = pd_snap["chg_pct"]
-            chg_cls   = ("tz-chg-pos" if chg > 0 else
-                         "tz-chg-neg" if chg < 0 else "tz-chg-neu")
-            chg_str   = f"{chg:+.2f}%"
+        # Signal stage, relvol trend, and plain-English reason
+        reason          = infer_signal_reason(sig_list, 0, score)
+        stage_lbl, stage_color = get_signal_stage(sig_list)
+        rv_hist         = load_relvol_trend(conn, tk)
+        if len(rv_hist) >= 2:
+            direction = "up" if rv_hist[0] > rv_hist[1] else "down" if rv_hist[0] < rv_hist[1] else "flat"
+            trend_str = f"&nbsp;·&nbsp; RelVol trend: {direction} ({rv_hist[1]:.1f}x to {rv_hist[0]:.1f}x)"
         else:
-            price_str = "--"
-            chg_cls   = "tz-chg-neu"
-            chg_str   = "--"
+            trend_str = ""
 
-        # Unusual volume flag -- fires if current volume is on pace to exceed 3-month average
-        vol_html = '<span style="min-width:18px;"></span>'
-        if pd_snap.get("volume") and pd_snap.get("avg_vol") and pd_snap["avg_vol"] > 0:
-            if pd_snap["volume"] > pd_snap["avg_vol"] * 0.5:
-                vol_html = '<span class="tz-vol-flag" title="Unusual volume">🔥</span>'
-
-        # Alert threshold highlighting
-        row_cls = "tz-alert-row" if score >= alert_threshold else "tz-row"
-
-        # Six-factor signal score
-        sig_list       = signals_batch.get(tk, [])
-        sig_pts, flags = compute_signal_score(tk, score, sig_list, herd_data.get(tk, {}))
-        sig_cls        = "sig-high" if sig_pts >= 4 else "sig-med" if sig_pts >= 2 else "sig-low"
-        sig_badge      = f'<span class="{sig_cls}">{sig_pts}/6</span>'
-
-    
-        # Relative volume -- prefer stored Finviz value (now covers every ticker
-        # Finviz returns, not just threshold-clearing ones), fall back to a live
-        # calculation from the yfinance snapshot.
-        finviz_rv = relvol_map.get(tk)
-        live_rv   = None
-        if pd_snap.get("volume") and pd_snap.get("avg_vol") and pd_snap["avg_vol"] > 0:
-            live_rv = pd_snap["volume"] / pd_snap["avg_vol"]
-        # Finviz and yfinance compute relvol differently, so mark which source this
-        # came from -- a yfinance-derived figure will not correspond to the Finviz
-        # unusual volume list, which is why a high "~" value may not appear there.
-        relvol_val = finviz_rv if finviz_rv else live_rv
-        if relvol_val:
-            is_finviz = finviz_rv is not None
-            rv_color  = ("#3fb950" if relvol_val >= 3 else
-                         "#e3b341" if relvol_val >= 1.5 else "#6e7681")
-            prefix    = "" if is_finviz else "~"
-            title     = ("Finviz relative volume" if is_finviz
-                         else "Estimated from yfinance -- not a Finviz figure, "
-                              "so it will not match the unusual volume list")
-            rv_html   = (f'<span title="{title}" style="color:{rv_color};font-size:11px;'
-                         f'min-width:48px;text-align:right;">{prefix}{relvol_val:.1f}x</span>')
+        fund   = load_fundamentals(tk)
+        mc_f   = fund.get("market_cap")
+        if mc_f:
+            _, _, mc_tier_short = get_cap_tier(mc_f)
+            mc_context = f"&nbsp;·&nbsp; {mc_tier_short} ({fmt_market_cap(mc_f)})"
         else:
-            rv_html = '<span style="min-width:48px;"></span>'
+            mc_context = ""
 
-        # Herd: bullish/bearish message counts plus herd keyword hits
-        hd = herd_data.get(tk, {})
-        if hd.get("total_posts"):
-            bull_ct  = hd["bullish_ct"]
-            bear_ct  = hd["bearish_ct"]
-            herd_ct  = hd["herd_hits"]
-            bp       = hd.get("bullish_pct")
-            hd_color = ("#3fb950" if bp and bp >= 0.6 else
-                        "#f85149" if bp and bp <= 0.4 else "#8b949e")
-            herd_flag = (f' <span style="color:#e3b341;">+{herd_ct}</span>'
-                         if herd_ct else "")
-            herd_html = (f'<span title="Last {herd_window_lbl}: {bull_ct} bullish / '
-                         f'{bear_ct} bearish messages, {herd_ct} herd keyword hits" '
-                         f'style="min-width:88px;text-align:right;font-size:11px;'
-                         f'color:{hd_color};">{bull_ct}/{bear_ct}{herd_flag}</span>')
-        else:
-            herd_html = '<span style="min-width:88px;"></span>'
-
-        # Composite rank score, now herd-aware
-        rs_html = ""
-        if show_rs:
-            rs = compute_composite(score, density, hd.get("herd_hits", 0),
-                                   hd.get("bullish_pct"))
-            rs_html = f'<span class="tz-rs">{rs:.3f}</span>'
-
-        # Market cap display string
-        mc_html = (
-            f'<span style="color:#6e7681;font-size:11px;'
-            f'min-width:60px;text-align:right;">'
-            f'{tier_short} {fmt_mc(mc)}</span>'
+        st.markdown(
+            f'<span style="color:{stage_color};font-weight:600;">{stage_lbl}</span>'
+            f'<span style="color:#6e7681;font-size:12px;">{trend_str}{mc_context}</span><br>'
+            f'<span style="color:#8b949e;font-size:12px;">Why on radar: {reason}</span>',
+            unsafe_allow_html=True
         )
 
-        st.markdown(f"""
-            <div class="{row_cls}">
-                <span class="tz-rank">{rank}</span>
-                <span class="tz-ticker"><a href="/company_deep_dive?ticker={tk}" target="_self"
-                    style="color:#58a6ff;text-decoration:none;">{tk}</a></span>
-                <span class="{score_cls}">{score:+.2f}</span>
-                {sentiment_bar_html(score)}
-                <span class="tz-price">{price_str}</span>
-                <span class="{chg_cls}">{chg_str}</span>
-                {rv_html}
-                <span class="tz-density">{density_val}</span>
-                {herd_html}
-                {mc_html}
-                {sig_badge}
-                {rs_html}
-            </div>
-        """, unsafe_allow_html=True)
+        # Six-factor breakdown
+        st.markdown(f"**Signal score: {sig_pts}/6**")
+        for icon, desc in flags:
+            st.markdown(f"{icon} {desc}")
 
-        # ── Drill-down expander ────────────────────────────────────────────────────
-        articles = load_ticker_articles(conn, tk, since_iso)
-        with st.expander(f"  {tk} -- fundamentals + articles"):
+        # Finviz news headline if available
+        fv_sig = next(
+            (s for s in sig_list
+             if s["type"] in ("unusual_volume", "unusual_volume_squeeze")),
+            None
+        )
+    
 
-            # Signal stage, relvol trend, and plain-English reason
-            reason          = infer_signal_reason(sig_list, 0, score)
-            stage_lbl, stage_color = get_signal_stage(sig_list)
-            rv_hist         = load_relvol_trend(conn, tk)
-            if len(rv_hist) >= 2:
-                direction = "up" if rv_hist[0] > rv_hist[1] else "down" if rv_hist[0] < rv_hist[1] else "flat"
-                trend_str = f"&nbsp;·&nbsp; RelVol trend: {direction} ({rv_hist[1]:.1f}x to {rv_hist[0]:.1f}x)"
-            else:
-                trend_str = ""
+        st.divider()
 
-            fund   = load_fundamentals(tk)
-            mc_f   = fund.get("market_cap")
-            if mc_f:
-                _, _, mc_tier_short = get_cap_tier(mc_f)
-                mc_context = f"&nbsp;·&nbsp; {mc_tier_short} ({fmt_market_cap(mc_f)})"
-            else:
-                mc_context = ""
-
-            st.markdown(
-                f'<span style="color:{stage_color};font-weight:600;">{stage_lbl}</span>'
-                f'<span style="color:#6e7681;font-size:12px;">{trend_str}{mc_context}</span><br>'
-                f'<span style="color:#8b949e;font-size:12px;">Why on radar: {reason}</span>',
-                unsafe_allow_html=True
-            )
-
-            # Six-factor breakdown
-            st.markdown(f"**Signal score: {sig_pts}/6**")
-            for icon, desc in flags:
-                st.markdown(f"{icon} {desc}")
-
-            # Finviz news headline if available
-            fv_sig = next(
-                (s for s in sig_list
-                 if s["type"] in ("unusual_volume", "unusual_volume_squeeze")),
-                None
-            )
-        
-
+        # Fundamentals from yfinance
+        if any(fund.values()):
+            f1, f2, f3, f4, f5 = st.columns(5)
+            with f1:
+                st.markdown(
+                    f'<span class="fund-label">Forward P/E</span>'
+                    f'<span class="fund-value">{_fmt_num(fund.get("fwd_pe"))}</span>',
+                    unsafe_allow_html=True
+                )
+            with f2:
+                st.markdown(
+                    f'<span class="fund-label">P/E (TTM)</span>'
+                    f'<span class="fund-value">{_fmt_num(fund.get("pe"))}</span>',
+                    unsafe_allow_html=True
+                )
+            with f3:
+                st.markdown(
+                    f'<span class="fund-label">Beta</span>'
+                    f'<span class="fund-value">{_fmt_num(fund.get("beta"), "{:.2f}")}</span>',
+                    unsafe_allow_html=True
+                )
+            with f4:
+                st.markdown(
+                    f'<span class="fund-label">Short float</span>'
+                    f'<span class="fund-value">{_fmt_num(fund.get("short_float"), "{:.1%}")}</span>',
+                    unsafe_allow_html=True
+                )
+            with f5:
+                st.markdown(
+                    f'<span class="fund-label">Sector</span>'
+                    f'<span class="fund-value">{fund.get("sector") or "--"}</span>',
+                    unsafe_allow_html=True
+                )
             st.divider()
 
-            # Fundamentals from yfinance
-            if any(fund.values()):
-                f1, f2, f3, f4, f5 = st.columns(5)
-                with f1:
-                    st.markdown(
-                        f'<span class="fund-label">Forward P/E</span>'
-                        f'<span class="fund-value">{_fmt_num(fund.get("fwd_pe"))}</span>',
-                        unsafe_allow_html=True
-                    )
-                with f2:
-                    st.markdown(
-                        f'<span class="fund-label">P/E (TTM)</span>'
-                        f'<span class="fund-value">{_fmt_num(fund.get("pe"))}</span>',
-                        unsafe_allow_html=True
-                    )
-                with f3:
-                    st.markdown(
-                        f'<span class="fund-label">Beta</span>'
-                        f'<span class="fund-value">{_fmt_num(fund.get("beta"), "{:.2f}")}</span>',
-                        unsafe_allow_html=True
-                    )
-                with f4:
-                    st.markdown(
-                        f'<span class="fund-label">Short float</span>'
-                        f'<span class="fund-value">{_fmt_num(fund.get("short_float"), "{:.1%}")}</span>',
-                        unsafe_allow_html=True
-                    )
-                with f5:
-                    st.markdown(
-                        f'<span class="fund-label">Sector</span>'
-                        f'<span class="fund-value">{fund.get("sector") or "--"}</span>',
-                        unsafe_allow_html=True
-                    )
-                st.divider()
-
-            # Recent articles driving the signal
-            if articles:
-                for title, link, source, ingested_at, art_score, reasoning in articles:
-                    sc       = art_score or 0
-                    sc_color = ("#3fb950" if sc > 0.05 else
-                                "#f85149" if sc < -0.05 else "#8b949e")
-                    sc_str   = f"{art_score:+.2f}" if art_score is not None else "--"
-                    st.markdown(f"""
-                        <div style="padding:7px 0;border-bottom:1px solid #1c1f26;">
-                            <span class="tz-article-meta">
-                                {fmt_time(ingested_at)} &nbsp;·&nbsp; {source}
-                                &nbsp;·&nbsp;
-                                <span style="color:{sc_color};font-weight:700;">{sc_str}</span>
-                            </span><br>
-                            <a class="tz-article-title" href="{link}"
-                               target="_blank">{title}</a>
-                            {"<br><span class='reasoning-text'>" + reasoning + "</span>"
-                             if reasoning else ""}
-                        </div>
-                    """, unsafe_allow_html=True)
-            else:
-                st.caption("No articles in this window for this ticker.")
+        # Recent articles driving the signal
+        if articles:
+            for title, link, source, ingested_at, art_score, reasoning in articles:
+                sc       = art_score or 0
+                sc_color = ("#3fb950" if sc > 0.05 else
+                            "#f85149" if sc < -0.05 else "#8b949e")
+                sc_str   = f"{art_score:+.2f}" if art_score is not None else "--"
+                st.markdown(f"""
+                    <div style="padding:7px 0;border-bottom:1px solid #1c1f26;">
+                        <span class="tz-article-meta">
+                            {fmt_time(ingested_at)} &nbsp;·&nbsp; {source}
+                            &nbsp;·&nbsp;
+                            <span style="color:{sc_color};font-weight:700;">{sc_str}</span>
+                        </span><br>
+                        <a class="tz-article-title" href="{link}"
+                           target="_blank">{title}</a>
+                        {"<br><span class='reasoning-text'>" + reasoning + "</span>"
+                         if reasoning else ""}
+                    </div>
+                """, unsafe_allow_html=True)
+        else:
+            st.caption("No articles in this window for this ticker.")
 
 
-    # ============================================================================
-    # FOOTER
-    # ============================================================================
+# ============================================================================
+# FOOTER
+# ============================================================================
 
-    density_lbl = "weighted" if use_weighted else "raw"
-    refresh_lbl = f" · auto-refresh {refresh_secs}s" if _HAS_AUTOREFRESH else ""
-    st.caption(
-        f"{len(tz_rows)} tickers · last {window_label} · "
-        f"{density_lbl} density · ranked by {sort_mode}{refresh_lbl}"
-    )
-
-
-with tab_vol:
-    # ============================================================================
-    # CURRENTLY ON UNUSUAL VOLUME
-    # ============================================================================
-
-    st.markdown("#### Currently on Unusual Volume")
-    st.caption(
-        "Tickers Finviz flagged for unusual relative volume in the last pipeline run. "
-        "Thresholds vary by market cap tier -- large caps flagged at lower relvol. "
-        "Squeeze = short float > 10% and days to cover > 5."
-    )
-
-    vol_tickers = load_unusual_volume_now(conn, lookback_hours=12)
-    if not vol_tickers:
-        st.info("No unusual volume data yet -- run the pipeline to populate.")
-    else:
-        if cap_filter:
-            vol_tickers = [
-                v for v in vol_tickers
-                if any(v["cap_tier"].startswith(c.split()[0]) for c in cap_filter)
-            ]
-
-        st.markdown(f"""
-            <div style="padding:6px 14px;display:flex;gap:12px;
-                        border-bottom:1px solid #3d444d;color:#6e7681;font-size:12px;">
-                <span style="min-width:60px;">Ticker</span>
-                <span style="min-width:80px;">Company</span>
-                <span style="min-width:54px;">RelVol</span>
-                <span style="min-width:54px;">Price</span>
-                <span style="min-width:54px;">Chg%</span>
-                <span style="min-width:80px;">Cap Tier</span>
-                <span style="min-width:60px;">Short Flt</span>
-                <span style="min-width:54px;">Days Cov</span>
-                <span style="min-width:88px;">Herd 24h (B/S)</span>
-                <span style="flex:1;">News</span>
-            </div>
-        """, unsafe_allow_html=True)
-
-        for v in vol_tickers:
-            tk        = v["ticker"]
-            rv        = v["relvol"]
-            squeeze   = v["squeeze"]
-            rv_color  = ("#3fb950" if rv and rv >= 3 else
-                         "#e3b341" if rv and rv >= 1.5 else "#8b949e")
-            chg       = v.get("change", "--") or "--"
-            chg_color = ("#3fb950" if chg.startswith("+") else
-                         "#f85149" if chg.startswith("-") else "#8b949e")
-            sf        = f"{v['short_float']:.1f}%" if v.get("short_float") else "--"
-            sr        = f"{v['short_ratio']:.1f}"  if v.get("short_ratio") else "--"
-            squeeze_label = " (sq)" if squeeze else ""
-            news_html = (
-                f'<a href="{v["news_url"]}" target="_blank" '
-                f'style="color:#58a6ff;font-size:11px;">'
-                f'{v["news_title"][:45]}{"..." if len(v["news_title"]) > 45 else ""}</a>'
-                if v.get("news_url") else
-                f'<span style="color:#6e7681;font-size:11px;">{v["news_title"][:50]}</span>'
-            )
-            rv_str = f"{rv:.1f}x" if rv else "--"
-
-            # Social herd context -- volume alone does not say whether the crowd is
-            # behind the move, which is the distinction that matters here.
-            uv_hd = load_herd_data((tk,)).get(tk, {})
-            if uv_hd.get("total_posts"):
-                uv_bp    = uv_hd.get("bullish_pct")
-                uv_color = ("#3fb950" if uv_bp and uv_bp >= 0.6 else
-                            "#f85149" if uv_bp and uv_bp <= 0.4 else "#8b949e")
-                uv_herd  = (f' <span style="color:#e3b341;">+{uv_hd["herd_hits"]}</span>'
-                            if uv_hd["herd_hits"] else "")
-                uv_herd_html = (f'<span style="min-width:88px;font-size:11px;'
-                                f'color:{uv_color};">'
-                                f'{uv_hd["bullish_ct"]}/{uv_hd["bearish_ct"]}{uv_herd}</span>')
-            else:
-                uv_herd_html = '<span style="min-width:88px;color:#6e7681;font-size:11px;">--</span>'
-
-            st.markdown(f"""
-                <div style="padding:9px 14px;border-bottom:1px solid #262730;
-                            display:flex;align-items:center;gap:12px;">
-                    <span style="color:#58a6ff;font-weight:700;min-width:60px;">
-                        {tk}{squeeze_label}</span>
-                    <span style="color:#8b949e;font-size:12px;min-width:80px;">
-                        {(v.get("company") or "")[:12]}</span>
-                    <span style="color:{rv_color};font-weight:600;min-width:54px;">
-                        {rv_str}</span>
-                    <span style="color:#e6edf3;font-size:12px;min-width:54px;">
-                        ${v.get("price","--")}</span>
-                    <span style="color:{chg_color};font-size:12px;min-width:54px;">
-                        {chg}</span>
-                    <span style="color:#6e7681;font-size:11px;min-width:80px;">
-                        {v.get("cap_tier","--")}</span>
-                    <span style="color:#8b949e;font-size:12px;min-width:60px;">
-                        {sf}</span>
-                    <span style="color:#8b949e;font-size:12px;min-width:54px;">
-                        {sr}</span>
-                    {uv_herd_html}
-                    <span style="flex:1;">{news_html}</span>
-                </div>
-            """, unsafe_allow_html=True)
-
-        st.caption(
-            f"{len(vol_tickers)} tickers on unusual volume list · "
-            "last pipeline run · sorted by relvol desc"
-        )
-
-
-with tab_pre:
-    # ============================================================================
-    # PRE-SIGNAL CANDIDATES
-    # ============================================================================
-
-    st.markdown("#### Pre-Signal Candidates")
-    st.caption(
-        "Tickers with social, news, or insider signals but not yet confirmed by unusual volume. "
-        "The herd has moved -- market volume has not followed yet. "
-        "These are early-stage watchlist candidates."
-    )
-
-    pc1, pc2 = st.columns([1, 3])
-    with pc1:
-        candidate_window = st.selectbox(
-            "First seen within",
-            ["1 hour", "4 hours", "12 hours", "24 hours", "7 days"],
-            index=3,
-            key="candidate_window",
-        )
-    window_hours_map = {
-        "1 hour": 1, "4 hours": 4, "12 hours": 12,
-        "24 hours": 24, "7 days": 168,
-    }
-    candidate_hours = window_hours_map[candidate_window]
-
-    candidates = load_pre_signal_candidates(
-        conn, lookback_days=candidate_hours / 24, vol_lookback_hours=48
-    )
-
-    # Filter by first-seen recency
-    cutoff_dt  = datetime.now(timezone.utc) - timedelta(hours=candidate_hours)
-    candidates = [
-        c for c in candidates
-        if datetime.fromisoformat(c["first_at"]).replace(tzinfo=timezone.utc) >= cutoff_dt
-    ]
-
-    # Sort by most recent first
-    candidates = sorted(candidates, key=lambda x: x["first_at"], reverse=True)
-
-    # Apply market cap filter using live yfinance data for candidate tickers
-    if cap_filter and candidates:
-        cand_tks   = tuple(c["ticker"] for c in candidates)
-        cand_snaps = load_price_snapshot(cand_tks)
-        candidates = [
-            c for c in candidates
-            if get_cap_tier(
-                cand_snaps.get(c["ticker"], {}).get("market_cap")
-            )[2] in cap_filter
-        ]
-
-    if not candidates:
-        st.info(
-            f"No pre-signal candidates in the last {candidate_window}. "
-            "Run the pipeline to update."
-        )
-    else:
-        st.markdown("""
-            <div style="padding:6px 14px;display:flex;gap:12px;
-                        border-bottom:1px solid #3d444d;color:#6e7681;font-size:12px;">
-                <span style="min-width:58px;">Ticker</span>
-                <span style="min-width:40px;">Score</span>
-                <span style="min-width:72px;">Social</span>
-                <span style="min-width:72px;">News</span>
-                <span style="flex:1;">Why on radar</span>
-                <span style="min-width:72px;text-align:right;">First seen</span>
-            </div>
-        """, unsafe_allow_html=True)
-
-        for c in candidates[:20]:
-            tk     = c["ticker"]
-            sc     = c["score"]
-            bp     = c["bull_pct"]
-            ns     = c["avg_score"]
-            reason = c["reason"]
-
-            sc_color = "#3fb950" if sc >= 3 else "#e3b341" if sc >= 2 else "#6e7681"
-            bp_str   = f"{bp:.0%}" if bp is not None else "--"
-            bp_color = ("#3fb950" if bp and bp >= 0.6 else
-                        "#f85149" if bp and bp <= 0.4 else "#8b949e")
-            ns_str   = f"{ns:+.2f} ({c['mentions']})" if ns is not None else "--"
-            ns_color = ("#3fb950" if ns and ns > 0.1 else
-                        "#f85149" if ns and ns < -0.1 else "#8b949e")
-
-            try:
-                dt   = datetime.fromisoformat(c["first_at"])
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                mins = int((datetime.now(timezone.utc) - dt).total_seconds() // 60)
-                age  = (f"{mins}m ago"       if mins < 60 else
-                        f"{mins//60}h ago"   if mins < 1440 else
-                        f"{mins//1440}d ago")
-            except Exception:
-                age = "--"
-
-            st.markdown(f"""
-                <div style="padding:9px 14px;border-bottom:1px solid #262730;
-                            display:flex;align-items:center;gap:12px;">
-                    <span style="color:#58a6ff;font-weight:700;min-width:58px;">{tk}</span>
-                    <span style="color:{sc_color};font-weight:700;min-width:40px;">{sc}/4</span>
-                    <span style="color:{bp_color};font-size:12px;min-width:72px;">{bp_str} bull</span>
-                    <span style="color:{ns_color};font-size:12px;min-width:72px;">{ns_str}</span>
-                    <span style="color:#8b949e;font-size:12px;flex:1;">{reason}</span>
-                    <span style="color:#6e7681;font-size:11px;min-width:72px;text-align:right;">{age}</span>
-                </div>
-            """, unsafe_allow_html=True)
-
-        st.caption(
-            f"{len(candidates)} pre-signal candidates · "
-            f"last {candidate_window} · sorted by signal strength"
-        )
+density_lbl = "weighted" if use_weighted else "raw"
+refresh_lbl = f" · auto-refresh {refresh_secs}s" if _HAS_AUTOREFRESH else ""
+st.caption(
+    f"{len(tz_rows)} tickers · last {window_label} · "
+    f"{density_lbl} density · ranked by {sort_mode}{refresh_lbl}"
+)

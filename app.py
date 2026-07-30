@@ -734,18 +734,22 @@ with tab_social:
     radar_cutoff = (datetime.now(timezone.utc) - timedelta(hours=radar_hours)).isoformat()
 
     radar_rows = conn.execute("""
-        SELECT ticker,
-               MAX(detected_at)              AS last_seen,
-               AVG(bullish_pct)               AS avg_bullish_pct,
-               SUM(COALESCE(bullish_count,0)) AS bullish_ct,
-               SUM(COALESCE(bearish_count,0)) AS bearish_ct,
-               SUM(COALESCE(post_count,0))    AS total_posts,
-               SUM(COALESCE(keyword_hits,0))  AS herd_hits,
-               MAX(CASE WHEN signal_type='social_spike' THEN 1 ELSE 0 END) AS has_spike
-        FROM   signals
-        WHERE  signal_type IN ('social_spike','social_read')
-          AND  detected_at >= ?
-        GROUP  BY ticker
+        SELECT s.ticker,
+               s.detected_at                AS last_seen,
+               s.bullish_pct                AS avg_bullish_pct,
+               COALESCE(s.bullish_count,0)  AS bullish_ct,
+               COALESCE(s.bearish_count,0)  AS bearish_ct,
+               COALESCE(s.post_count,0)     AS total_posts,
+               COALESCE(s.keyword_hits,0)   AS herd_hits,
+               CASE WHEN s.signal_type='social_spike' THEN 1 ELSE 0 END AS has_spike
+        FROM   signals s
+        JOIN  (SELECT ticker, MAX(detected_at) AS latest
+               FROM   signals
+               WHERE  signal_type IN ('social_spike','social_read')
+                 AND  detected_at >= ?
+               GROUP  BY ticker) m
+          ON   m.ticker = s.ticker AND m.latest = s.detected_at
+        WHERE  s.signal_type IN ('social_spike','social_read')
         ORDER  BY herd_hits DESC, total_posts DESC
     """, (radar_cutoff,)).fetchall()
 
@@ -853,5 +857,4 @@ with tab_trader:
     # URL is dynamic -- uses Railway public domain in production, localhost in development
     st.page_link("pages/trader_zone.py", label="Open Trader Zone", icon=":material/table_chart:")
     st.page_link("pages/company_deep_dive.py", label="Company Deep Dive", icon=":material/search:")
-    st.markdown("<br>", unsafe_allow_html=True)
-    st.link_button("Company Deep Dive", url=f"{_base_url}/company_deep_dive")
+    

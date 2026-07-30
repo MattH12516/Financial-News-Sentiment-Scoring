@@ -1162,6 +1162,18 @@ HERD_KEYWORDS = {
 # Emoji shorthand commonly used in retail trading posts as herd signals
 HERD_EMOJIS = {"🐋", "🚀", "💎", "🙌"}
 
+# Cashtags are stripped before keyword matching. Without this the ticker symbol
+# itself matches a keyword: every DuPont post carries "$DD" and "dd" is a herd
+# keyword, so DD registered 100% herd activity on every message.
+CASHTAG_RE = re.compile(r"\$[A-Za-z][A-Za-z.\-]{0,9}")
+
+# Word-boundary match so "dd" no longer fires on added/sudden/hidden and
+# "puts" no longer fires on inputs/outputs.
+HERD_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(k) for k in sorted(HERD_KEYWORDS)) + r")\b",
+    re.IGNORECASE,
+)
+
 
 def fetch_stocktwits_stream(ticker, limit=30):
     """Fetch live Stocktwits message stream for a ticker via the public API.
@@ -1197,9 +1209,9 @@ def _parse_social(data):
             bullish += 1
         if tag == "Bearish":
             bearish += 1
-        body = m.get("body") or ""
-        if (any(kw in body.lower() for kw in HERD_KEYWORDS)
-                or any(e in body for e in HERD_EMOJIS)):
+        body  = m.get("body") or ""
+        clean = CASHTAG_RE.sub(" ", body)
+        if HERD_RE.search(clean) or any(e in clean for e in HERD_EMOJIS):
             kw_hits += 1
     tagged      = bullish + bearish
     bullish_pct = bullish / tagged if tagged > 0 else None
