@@ -464,6 +464,31 @@ def init_db(conn):
         "ON relvol_history(ticker, snapshot_at)"
     )
 
+    # Watchlist -- one row per recorded pick. snapshot_json freezes the signal
+    # state at the moment of adding so the pick can be judged later against
+    # what was actually known at the time, not against current values.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS watchlist (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker        TEXT NOT NULL,
+            added_at      TEXT NOT NULL,
+            added_price   REAL,
+            entry_price   REAL,
+            target_price  REAL,
+            stop_price    REAL,
+            thesis        TEXT,
+            snapshot_json TEXT,
+            status        TEXT NOT NULL DEFAULT 'watching',
+            closed_at     TEXT,
+            closed_price  REAL,
+            outcome_note  TEXT
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_watchlist_ticker "
+        "ON watchlist(ticker, status)"
+    )
+
     # Add metadata column to signals if missing from older schema
     sig_cols = {row[1] for row in conn.execute("PRAGMA table_info(signals)")}
     if "metadata" not in sig_cols:

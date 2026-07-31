@@ -481,6 +481,123 @@ elif relvol is not None:
                 "news or social signals recorded.")
 else:
     st.info(f"No relative volume reading recorded for {ticker} yet.")
+
+# ============================================================================
+# WATCHLIST -- add this ticker with its signal state frozen
+# ============================================================================
+
+def ensure_watchlist(conn):
+    """Create the table on demand so the page works even if the pipeline
+    has not been run since the schema changed."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS watchlist (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker        TEXT NOT NULL,
+            added_at      TEXT NOT NULL,
+            added_price   REAL,
+            entry_price   REAL,
+            target_price  REAL,
+            stop_price    REAL,
+            thesis        TEXT,
+            snapshot_json TEXT,
+            status        TEXT NOT NULL DEFAULT 'watching',
+            closed_at     TEXT,
+            closed_price  REAL,
+            outcome_note  TEXT
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_watchlist_ticker "
+                 "ON watchlist(ticker, status)")
+    conn.commit()
+
+
+ensure_watchlist(conn)
+
+_open_pick = conn.execute(
+    "SELECT added_at, entry_price FROM watchlist "
+    "WHERE ticker = ? AND status != 'closed' "
+    "ORDER BY added_at DESC LIMIT 1", (ticker,)
+).fetchone()
+
+if _open_pick:
+    st.caption(f"{ticker} is already on the watchlist -- added "
+               f"{_open_pick[0][:10]} at ${_open_pick[1]:.2f} entry.")
+
+with st.expander(f"Add {ticker} to watchlist", expanded=False):
+    st.caption(
+        "The signal state below is frozen at the moment you add. Set target "
+        "and stop now, before the price moves -- choosing the exit afterwards "
+        "makes the pick impossible to judge."
+    )
+
+    _live = snap.get("price") if snap else 0.0
+
+    w1, w2, w3 = st.columns(3)
+    with w1:
+        _entry = st.number_input("Entry price", min_value=0.0, step=0.01,
+                                 value=float(_live or 0.0), format="%.2f")
+    with w2:
+        _target = st.number_input("Target price", min_value=0.0, step=0.01,
+                                  value=float(round((_live or 0.0) * 1.10, 2)),
+                                  format="%.2f")
+    with w3:
+        _stop = st.number_input("Stop price", min_value=0.0, step=0.01,
+                                value=float(round((_live or 0.0) * 0.95, 2)),
+                                format="%.2f")
+
+    _thesis = st.text_area(
+        "Why this one",
+        placeholder="Which signals agreed, and what you expect to happen.",
+        height=80,
+    )
+
+    if st.button("Add to watchlist", type="primary", key="wl_add"):
+        if min(_entry, _target, _stop) <= 0:
+            st.error("Entry, target and stop all need a price.")
+        elif _target <= _entry:
+            st.error("Target should be above entry.")
+        elif _stop >= _entry:
+            st.error("Stop should be below entry.")
+        elif not _thesis.strip():
+            st.error("Write a short thesis -- it is the point of the record.")
+        else:
+            _since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+            _sent  = conn.execute("""
+                SELECT AVG(score), COUNT(*) FROM ticker_mentions
+                WHERE  ticker = ? AND score IS NOT NULL AND mentioned_at >= ?
+            """, (ticker, _since)).fetchone()
+
+            _snapshot = {
+                "price":            snap.get("price") if snap else None,
+                "chg_pct":          snap.get("chg_pct") if snap else None,
+                "relvol":           relvol,
+                "relvol_threshold": threshold,
+                "cap_tier":         tier_lbl,
+                "market_cap":       mc,
+                "avg_sentiment":    _sent[0],
+                "mentions_24h":     _sent[1],
+                "bullish_pct":      herd.get("bullish_pct"),
+                "bullish_ct":       herd.get("bullish_ct"),
+                "bearish_ct":       herd.get("bearish_ct"),
+                "herd_hits":        herd.get("herd_hits"),
+                "total_posts":      herd.get("total_posts"),
+                "on_volume_list":   on_vol_list,
+                "whale_buying":     has_whale,
+                "signal_types":     sorted({s["type"] for s in sigs}),
+            }
+
+            conn.execute("""
+                INSERT INTO watchlist
+                (ticker, added_at, added_price, entry_price, target_price,
+                 stop_price, thesis, snapshot_json, status)
+                VALUES (?,?,?,?,?,?,?,?,'watching')
+            """, (ticker, datetime.now(timezone.utc).isoformat(),
+                  snap.get("price") if snap else None,
+                  _entry, _target, _stop, _thesis.strip(),
+                  json.dumps(_snapshot)))
+            conn.commit()
+            st.success(f"{ticker} added -- snapshot frozen.")
+            st.rerun()
 # ============================================================================
 # CHART
 # ============================================================================
