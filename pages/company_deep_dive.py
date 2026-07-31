@@ -524,61 +524,64 @@ if _open_pick:
                f"{_open_pick[0][:10]} at ${_open_pick[1]:.2f} entry.")
 
 with st.expander(f"Add {ticker} to watchlist", expanded=False):
-    st.caption(
-        "Records the ticker with its signal state frozen at this moment, so "
-        "you can see later what the data looked like when you flagged it."
-    )
+    _live = snap.get("price") if snap else None
+    if _live is None:
+        try:
+            _fi   = yf.Ticker(ticker).fast_info
+            _live = _fi.get("last_price") if hasattr(_fi, "get") else None
+            if _live is None:
+                _live = getattr(_fi, "last_price", None)
+            _live = float(_live) if _live else None
+        except Exception:
+            _live = None
 
-    _live = snap.get("price") if snap else 0.0
+    if _live:
+        st.caption(f"Records {ticker} at ${_live:.2f}, with its signal state "
+                   "frozen at this moment.")
+    else:
+        st.caption(f"No live price available for {ticker} right now -- it will "
+                   "be recorded without a reference price.")
 
-    w1, w2 = st.columns([1, 3])
-    with w1:
-        _entry = st.number_input("Price when added", min_value=0.0, step=0.01,
-                                 value=float(_live or 0.0), format="%.2f")
-    with w2:
-        _note = st.text_input("Note (optional)",
-                              placeholder="Anything worth remembering.")
+    _note = st.text_input("Note (optional)",
+                          placeholder="Anything worth remembering.")
 
     if st.button("Add to watchlist", type="primary", key="wl_add"):
-        if _entry <= 0:
-            st.error("Need a price.")
-        else:
-            _since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
-            _sent  = conn.execute("""
-                SELECT AVG(score), COUNT(*) FROM ticker_mentions
-                WHERE  ticker = ? AND score IS NOT NULL AND mentioned_at >= ?
-            """, (ticker, _since)).fetchone()
+        _since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+        _sent  = conn.execute("""
+            SELECT AVG(score), COUNT(*) FROM ticker_mentions
+            WHERE  ticker = ? AND score IS NOT NULL AND mentioned_at >= ?
+        """, (ticker, _since)).fetchone()
 
-            _snapshot = {
-                "price":            snap.get("price") if snap else None,
-                "chg_pct":          snap.get("chg_pct") if snap else None,
-                "relvol":           relvol,
-                "relvol_threshold": threshold,
-                "cap_tier":         tier_lbl,
-                "market_cap":       mc,
-                "avg_sentiment":    _sent[0],
-                "mentions_24h":     _sent[1],
-                "bullish_pct":      herd.get("bullish_pct"),
-                "bullish_ct":       herd.get("bullish_ct"),
-                "bearish_ct":       herd.get("bearish_ct"),
-                "herd_hits":        herd.get("herd_hits"),
-                "total_posts":      herd.get("total_posts"),
-                "on_volume_list":   on_vol_list,
-                "whale_buying":     has_whale,
-                "signal_types":     sorted({s["type"] for s in sigs}),
-            }
+        _snapshot = {
+            "price":            _live,
+            "chg_pct":          snap.get("chg_pct") if snap else None,
+            "relvol":           relvol,
+            "relvol_threshold": threshold,
+            "cap_tier":         tier_lbl,
+            "market_cap":       mc,
+            "avg_sentiment":    _sent[0],
+            "mentions_24h":     _sent[1],
+            "bullish_pct":      herd.get("bullish_pct"),
+            "bullish_ct":       herd.get("bullish_ct"),
+            "bearish_ct":       herd.get("bearish_ct"),
+            "herd_hits":        herd.get("herd_hits"),
+            "total_posts":      herd.get("total_posts"),
+            "on_volume_list":   on_vol_list,
+            "whale_buying":     has_whale,
+            "signal_types":     sorted({s["type"] for s in sigs}),
+        }
 
-            conn.execute("""
-                INSERT INTO watchlist
-                (ticker, added_at, added_price, entry_price, thesis,
-                 snapshot_json, status)
-                VALUES (?,?,?,?,?,?,'watching')
-            """, (ticker, datetime.now(timezone.utc).isoformat(),
-                  snap.get("price") if snap else None,
-                  _entry, _note.strip() or None, json.dumps(_snapshot)))
-            conn.commit()
-            st.success(f"{ticker} added.")
-            st.rerun()
+        conn.execute("""
+            INSERT INTO watchlist
+            (ticker, added_at, added_price, entry_price, thesis,
+             snapshot_json, status)
+            VALUES (?,?,?,?,?,?,'watching')
+        """, (ticker, datetime.now(timezone.utc).isoformat(),
+              _live, _live, _note.strip() or None, json.dumps(_snapshot)))
+        conn.commit()
+        st.success(f"{ticker} added at ${_live:.2f}." if _live
+                   else f"{ticker} added.")
+        st.rerun()
 # ============================================================================
 # CHART
 # ============================================================================

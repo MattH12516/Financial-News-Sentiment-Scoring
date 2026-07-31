@@ -899,16 +899,29 @@ with tab_watch:
         st.info("Nothing here yet. Add tickers from the Company Deep Dive "
                 "page, under Signal Status.")
     else:
-        def _wl_price(tk):
-            df = load_price_data(tk, "1d", "1m")
-            if df is None or df.empty:
-                return None
-            return float(df["price"].iloc[-1])
+        @st.cache_data(ttl=300, show_spinner=False)
+        def _wl_prices(tickers):
+            out = {}
+            for t in tickers:
+                px = None
+                try:
+                    fi = yf.Ticker(t).fast_info
+                    px = fi.get("last_price") if hasattr(fi, "get") else None
+                    if px is None:
+                        px = getattr(fi, "last_price", None)
+                except Exception:
+                    px = None
+                if px is None:
+                    try:
+                        df = load_price_data(t, "1d", "1m")
+                        if df is not None and not df.empty:
+                            px = float(df["price"].iloc[-1])
+                    except Exception:
+                        px = None
+                out[t] = float(px) if px else None
+            return out
 
-        live = {}
-        for _r in wl_rows:
-            if _r[1] not in live:
-                live[_r[1]] = _wl_price(_r[1])
+        live = _wl_prices(tuple(sorted({r[1] for r in wl_rows})))
 
         st.caption(f"{len(wl_rows)} on the list")
         st.divider()
