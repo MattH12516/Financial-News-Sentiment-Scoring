@@ -525,41 +525,23 @@ if _open_pick:
 
 with st.expander(f"Add {ticker} to watchlist", expanded=False):
     st.caption(
-        "The signal state below is frozen at the moment you add. Set target "
-        "and stop now, before the price moves -- choosing the exit afterwards "
-        "makes the pick impossible to judge."
+        "Records the ticker with its signal state frozen at this moment, so "
+        "you can see later what the data looked like when you flagged it."
     )
 
     _live = snap.get("price") if snap else 0.0
 
-    w1, w2, w3 = st.columns(3)
+    w1, w2 = st.columns([1, 3])
     with w1:
-        _entry = st.number_input("Entry price", min_value=0.0, step=0.01,
+        _entry = st.number_input("Price when added", min_value=0.0, step=0.01,
                                  value=float(_live or 0.0), format="%.2f")
     with w2:
-        _target = st.number_input("Target price", min_value=0.0, step=0.01,
-                                  value=float(round((_live or 0.0) * 1.10, 2)),
-                                  format="%.2f")
-    with w3:
-        _stop = st.number_input("Stop price", min_value=0.0, step=0.01,
-                                value=float(round((_live or 0.0) * 0.95, 2)),
-                                format="%.2f")
-
-    _thesis = st.text_area(
-        "Why this one",
-        placeholder="Which signals agreed, and what you expect to happen.",
-        height=80,
-    )
+        _note = st.text_input("Note (optional)",
+                              placeholder="Anything worth remembering.")
 
     if st.button("Add to watchlist", type="primary", key="wl_add"):
-        if min(_entry, _target, _stop) <= 0:
-            st.error("Entry, target and stop all need a price.")
-        elif _target <= _entry:
-            st.error("Target should be above entry.")
-        elif _stop >= _entry:
-            st.error("Stop should be below entry.")
-        elif not _thesis.strip():
-            st.error("Write a short thesis -- it is the point of the record.")
+        if _entry <= 0:
+            st.error("Need a price.")
         else:
             _since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
             _sent  = conn.execute("""
@@ -588,15 +570,14 @@ with st.expander(f"Add {ticker} to watchlist", expanded=False):
 
             conn.execute("""
                 INSERT INTO watchlist
-                (ticker, added_at, added_price, entry_price, target_price,
-                 stop_price, thesis, snapshot_json, status)
-                VALUES (?,?,?,?,?,?,?,?,'watching')
+                (ticker, added_at, added_price, entry_price, thesis,
+                 snapshot_json, status)
+                VALUES (?,?,?,?,?,?,'watching')
             """, (ticker, datetime.now(timezone.utc).isoformat(),
                   snap.get("price") if snap else None,
-                  _entry, _target, _stop, _thesis.strip(),
-                  json.dumps(_snapshot)))
+                  _entry, _note.strip() or None, json.dumps(_snapshot)))
             conn.commit()
-            st.success(f"{ticker} added -- snapshot frozen.")
+            st.success(f"{ticker} added.")
             st.rerun()
 # ============================================================================
 # CHART

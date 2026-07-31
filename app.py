@@ -884,21 +884,19 @@ with tab_watch:
 
     st.markdown("### Watchlist")
     st.caption(
-        "Picks recorded with the signal state frozen at the moment of adding. "
-        "Entry, target and stop are set in advance, so each pick can be judged "
-        "against what was known at the time rather than against current values."
+        "Tickers flagged from the Company Deep Dive page, each with the signal "
+        "state frozen at the moment it was added. Paper trades are tracked "
+        "separately in Investopedia."
     )
 
     wl_rows = conn.execute("""
-        SELECT id, ticker, added_at, added_price, entry_price, target_price,
-               stop_price, thesis, snapshot_json, status, closed_at,
-               closed_price, outcome_note
+        SELECT id, ticker, added_at, entry_price, thesis, snapshot_json
         FROM   watchlist
-        ORDER  BY CASE status WHEN 'watching' THEN 0 ELSE 1 END, added_at DESC
+        ORDER  BY added_at DESC
     """).fetchall()
 
     if not wl_rows:
-        st.info("Nothing recorded yet. Add tickers from the Company Deep Dive "
+        st.info("Nothing here yet. Add tickers from the Company Deep Dive "
                 "page, under Signal Status.")
     else:
         def _wl_price(tk):
@@ -909,25 +907,14 @@ with tab_watch:
 
         live = {}
         for _r in wl_rows:
-            if _r[9] != "closed" and _r[1] not in live:
+            if _r[1] not in live:
                 live[_r[1]] = _wl_price(_r[1])
 
-        n_closed = sum(1 for r in wl_rows if r[9] == "closed")
-        n_open   = len(wl_rows) - n_closed
-        n_up     = sum(1 for r in wl_rows
-                       if r[9] == "closed" and r[11] and r[4] and r[11] > r[4])
-
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Open picks", n_open)
-        m2.metric("Closed", n_closed)
-        m3.metric("Closed above entry", f"{n_up}/{n_closed}" if n_closed else "--")
+        st.caption(f"{len(wl_rows)} on the list")
         st.divider()
 
-        for r in wl_rows:
-            (wid, tk, added_at, added_px, entry, target, stop, thesis,
-             snap_json, status, closed_at, closed_px, outcome) = r
-
-            cur = closed_px if status == "closed" else live.get(tk)
+        for wid, tk, added_at, entry, note, snap_json in wl_rows:
+            cur = live.get(tk)
             if cur and entry:
                 pct   = (cur - entry) / entry * 100
                 color = ("#3fb950" if pct > 0 else
@@ -936,54 +923,30 @@ with tab_watch:
             else:
                 color, pct_s = "#8b949e", "--"
 
-            if status == "closed":
-                state = "closed"
-            elif cur and cur >= target:
-                state = "target hit"
-            elif cur and cur <= stop:
-                state = "stop hit"
-            else:
-                state = status
-            state_col = ("#3fb950" if state == "target hit" else
-                         "#f85149" if state == "stop hit" else "#8b949e")
-
-            c1, c2, c3, c4, c5 = st.columns([1.1, 2.5, 1.6, 1.1, 1.0])
+            c1, c2, c3, c4 = st.columns([1.2, 2.0, 2.0, 0.9])
             with c1:
                 st.markdown(
                     f"**{tk}**<br><span style='color:#8b949e;font-size:12px'>"
                     f"{added_at[:10]}</span>", unsafe_allow_html=True)
             with c2:
                 st.markdown(
-                    f"<span style='font-size:13px;color:#8b949e'>entry "
-                    f"${entry:.2f} &nbsp;·&nbsp; target ${target:.2f} "
-                    f"&nbsp;·&nbsp; stop ${stop:.2f}</span>",
-                    unsafe_allow_html=True)
+                    f"<span style='font-size:13px;color:#8b949e'>added at "
+                    f"${entry:.2f}</span>", unsafe_allow_html=True)
             with c3:
                 cur_s = f"${cur:.2f}" if cur else "--"
                 st.markdown(
-                    f"<span style='font-size:13px'>{cur_s}</span> "
+                    f"<span style='font-size:13px'>{cur_s}</span> &nbsp;"
                     f"<span style='color:{color};font-weight:600'>{pct_s}</span>",
                     unsafe_allow_html=True)
             with c4:
-                st.markdown(
-                    f"<span style='color:{state_col};font-size:13px'>{state}</span>",
-                    unsafe_allow_html=True)
-            with c5:
-                if status != "closed":
-                    if st.button("Close", key=f"wl_close_{wid}"):
-                        conn.execute(
-                            "UPDATE watchlist SET status='closed', closed_at=?, "
-                            "closed_price=? WHERE id=?",
-                            (datetime.now(timezone.utc).isoformat(), cur, wid))
-                        conn.commit()
-                        st.rerun()
-                elif st.button("Delete", key=f"wl_del_{wid}"):
+                if st.button("Remove", key=f"wl_del_{wid}"):
                     conn.execute("DELETE FROM watchlist WHERE id=?", (wid,))
                     conn.commit()
                     st.rerun()
 
-            with st.expander("thesis and snapshot at add time", expanded=False):
-                st.markdown(f"**Thesis:** {thesis or '--'}")
+            with st.expander("signal state when added", expanded=False):
+                if note:
+                    st.markdown(f"**Note:** {note}")
                 try:
                     _d = json.loads(snap_json or "{}")
                 except Exception:
