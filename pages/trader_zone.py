@@ -297,22 +297,46 @@ def load_ticker_articles(conn, ticker, since_iso):
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
-def _fetch_one_snapshot(tk):
-    """Fetch a single ticker's price snapshot. Returns (ticker, data_or_None)."""
-    try:
-        fi  = yf.Ticker(tk).fast_info
-        px  = fi.last_price
-        prv = fi.previous_close
-        if px and prv:
-            return tk, {
-                "price":      round(px, 2),
-                "chg_pct":    100 * (px - prv) / prv,
-                "volume":     getattr(fi, "last_volume", None),
-                "avg_vol":    getattr(fi, "three_month_average_volume", None),
-                "market_cap": getattr(fi, "market_cap", None),
-            }
-    except Exception:
-        pass
+def _fetch_one_snapshot(tk, attempts=3):
+    """Fetch a single ticker's price snapshot. Returns (ticker, data_or_None).
+
+    previous_close comes from daily history rather than fast_info.previous_close,
+    which has been observed returning values matching no recent session (it once
+    reported +13.98% on a day that was actually +7.40%).
+
+    Retries with backoff -- yfinance throttles under concurrent load and returns
+    empty rather than raising, which silently blanks the row."""
+    for i in range(attempts):
+        try:
+            t   = yf.Ticker(tk)
+            fi  = t.fast_info
+            px  = fi.last_price
+            prv = None
+            try:
+                closes = t.history(period="5d", interval="1d")["Close"].dropna()
+                if len(closes) >= 2:
+                    prv = float(closes.iloc[-2])
+                    if not px:
+                        px = float(closes.iloc[-1])
+            except Exception:
+                prv = None
+            if not prv:
+                try:
+                    prv = fi.previous_close
+                except Exception:
+                    prv = None
+            if px and prv:
+                return tk, {
+                    "price":      round(px, 2),
+                    "chg_pct":    100 * (px - prv) / prv,
+                    "volume":     getattr(fi, "last_volume", None),
+                    "avg_vol":    getattr(fi, "three_month_average_volume", None),
+                    "market_cap": getattr(fi, "market_cap", None),
+                }
+        except Exception:
+            pass
+        if i < attempts - 1:
+            time.sleep(0.5 * (i + 1))
     return tk, None
 
 
@@ -323,7 +347,7 @@ def load_price_snapshot(ticker_tuple):
     Cached 5 minutes. Only successful fetches are cached -- a transient yfinance
     failure on one run won't get frozen into the cache for the full TTL."""
     result = {}
-    with ThreadPoolExecutor(max_workers=20) as executor:
+    with ThreadPoolExecutor(max_workers=6) as executor:
         futures = [executor.submit(_fetch_one_snapshot, tk) for tk in ticker_tuple]
         for future in as_completed(futures):
             tk, data = future.result()
