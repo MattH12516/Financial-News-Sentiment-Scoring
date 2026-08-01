@@ -297,46 +297,22 @@ def load_ticker_articles(conn, ticker, since_iso):
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
-def _fetch_one_snapshot(tk, attempts=3):
-    """Fetch a single ticker's price snapshot. Returns (ticker, data_or_None).
-
-    previous_close comes from daily history rather than fast_info.previous_close,
-    which has been observed returning values matching no recent session (it once
-    reported +13.98% on a day that was actually +7.40%).
-
-    Retries with backoff -- yfinance throttles under concurrent load and returns
-    empty rather than raising, which silently blanks the row."""
-    for i in range(attempts):
-        try:
-            t   = yf.Ticker(tk)
-            fi  = t.fast_info
-            px  = fi.last_price
-            prv = None
-            try:
-                closes = t.history(period="5d", interval="1d")["Close"].dropna()
-                if len(closes) >= 2:
-                    prv = float(closes.iloc[-2])
-                    if not px:
-                        px = float(closes.iloc[-1])
-            except Exception:
-                prv = None
-            if not prv:
-                try:
-                    prv = fi.previous_close
-                except Exception:
-                    prv = None
-            if px and prv:
-                return tk, {
-                    "price":      round(px, 2),
-                    "chg_pct":    100 * (px - prv) / prv,
-                    "volume":     getattr(fi, "last_volume", None),
-                    "avg_vol":    getattr(fi, "three_month_average_volume", None),
-                    "market_cap": getattr(fi, "market_cap", None),
-                }
-        except Exception:
-            pass
-        if i < attempts - 1:
-            time.sleep(0.5 * (i + 1))
+def _fetch_one_snapshot(tk):
+    """Fetch a single ticker's price snapshot. Returns (ticker, data_or_None)."""
+    try:
+        fi  = yf.Ticker(tk).fast_info
+        px  = fi.last_price
+        prv = fi.previous_close
+        if px and prv:
+            return tk, {
+                "price":      round(px, 2),
+                "chg_pct":    100 * (px - prv) / prv,
+                "volume":     getattr(fi, "last_volume", None),
+                "avg_vol":    getattr(fi, "three_month_average_volume", None),
+                "market_cap": getattr(fi, "market_cap", None),
+            }
+    except Exception:
+        pass
     return tk, None
 
 
@@ -347,13 +323,36 @@ def load_price_snapshot(ticker_tuple):
     Cached 5 minutes. Only successful fetches are cached -- a transient yfinance
     failure on one run won't get frozen into the cache for the full TTL."""
     result = {}
-    with ThreadPoolExecutor(max_workers=6) as executor:
+    with ThreadPoolExecutor(max_workers=20) as executor:
         futures = [executor.submit(_fetch_one_snapshot, tk) for tk in ticker_tuple]
         for future in as_completed(futures):
             tk, data = future.result()
             if data:
                 result[tk] = data
     return result
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def load_market_caps(ticker_tuple):
+    """Market cap only, for every ticker -- needed to filter by cap tier before
+    paginating. Cached 6 hours because market cap barely moves intraday, so the
+    cost is paid once rather than on every rerun. Only called when a cap filter
+    is actually selected."""
+    result = {}
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        futures = {executor.submit(_fetch_one_cap, tk): tk for tk in ticker_tuple}
+        for future in as_completed(futures):
+            tk, mc = future.result()
+            if mc:
+                result[tk] = mc
+    return result
+
+
+def _fetch_one_cap(tk):
+    try:
+        return tk, yf.Ticker(tk).fast_info.market_cap
+    except Exception:
+        return tk, None
+
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_fundamentals(ticker):
@@ -771,20 +770,38 @@ conn = get_connection()
 # ============================================================================
 c1, c2, c3, c4, c5 = st.columns([1, 1, 1, 1, 2])
 
+# Every control carries an explicit key so Streamlit keeps its value in
+# session_state. Without keys the widgets reset to their defaults whenever this
+# page unmounts -- which is what made a trip to Company Deep Dive and back wipe
+# the time window, sort, and filters.
+PAGE_SIZE = 25
+
+
+def _reset_page():
+    """Any filter or sort change invalidates the current page number."""
+    st.session_state["tz_page"] = 1
+
+
 with c1:
     window_label = st.radio(
-        "Time window", ["10 min", "30 min", "1 hour", "4 hours", "24 hours"], index=2
+        "Time window", ["10 min", "30 min", "1 hour", "4 hours", "24 hours"],
+        index=2, key="tz_window", on_change=_reset_page,
     )
 with c2:
-    use_weighted = st.radio("Density mode", ["Raw mentions", "Weighted"]) == "Weighted"
+    use_weighted = st.radio(
+        "Density mode", ["Raw mentions", "Weighted"],
+        key="tz_density", on_change=_reset_page,
+    ) == "Weighted"
     ticker_filter = st.text_input(
         "Filter ticker", placeholder="e.g. AAPL",
-        help="Show only this ticker"
+        help="Show only this ticker",
+        key="tz_ticker", on_change=_reset_page,
     ).strip().upper()
 with c3:
     sort_label = st.radio(
         "Rank by", ["Composite", "Score", "Density", "Herd"],
-        help="Composite = sentiment x log(1 + density) x herd multiplier"
+        help="Composite = sentiment x log(1 + density) x herd multiplier",
+        key="tz_sort", on_change=_reset_page,
     )
     sort_mode  = sort_label.lower().split()[0]
     vol_filter = st.radio(
@@ -795,24 +812,29 @@ with c3:
             "On volume list = confirmed by Finviz unusual volume. "
             "Pre-signal = signals fired but not yet on volume list."
         ),
+        key="tz_vol", on_change=_reset_page,
     )
 with c4:
     alert_threshold = st.slider(
         "Alert threshold", 0.0, 1.0, 0.6, 0.05,
-        help="Rows with score >= this are highlighted green"
+        help="Rows with score >= this are highlighted green",
+        key="tz_alert",
     )
     cap_filter = st.multiselect(
         "Market cap filter",
         ["Mega $200B+", "Large $10B-$200B", "Mid $2B-$10B",
          "Small $300M-$2B", "Micro $50M-$300M", "Nano <$50M"],
         default=[],
-        help="Leave empty to show all.",
+        help="Leave empty to show all. Selecting a size fetches market caps for "
+             "every ticker, which makes the first load after a change slower.",
         placeholder="All sizes",
+        key="tz_cap", on_change=_reset_page,
     )
 with c5:
     refresh_secs = st.select_slider(
         "Auto-refresh interval", options=[30, 60, 120, 300], value=60,
-        format_func=lambda x: f"{x}s" if x < 60 else f"{x//60}m"
+        format_func=lambda x: f"{x}s" if x < 60 else f"{x//60}m",
+        key="tz_refresh_secs",
     )
     auto_pipeline = st.toggle(
         "Auto-run pipeline",
@@ -909,8 +931,11 @@ if not tz_rows:
     )
     st.stop()
 
-# Batch price fetch -- capped at 100 tickers to avoid rate limiting
-all_tks = tuple(r[0] for r in tz_rows if r[1] is not None)[:100]
+# Every ticker in the window. The old code sliced this to 100 *before* sorting,
+# so which tickers had data was decided by the pre-sort order while the display
+# order was something else -- that is why rows showed "--" in scattered places
+# rather than in a contiguous block at the bottom.
+all_tks = tuple(r[0] for r in tz_rows if r[1] is not None)
 
 # Unusual volume ticker set -- 24h lookback regardless of selected time window
 uv_cutoff  = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
@@ -920,8 +945,9 @@ uv_tickers = {r[0] for r in conn.execute("""
       AND detected_at >= ?
 """, (uv_cutoff,)).fetchall()}
 
-with st.spinner(f"Loading live prices for {len(all_tks)} tickers..."):
-    price_snap = load_price_snapshot(all_tks)
+# These loaders all read SQLite, so they are cheap enough to run across every
+# ticker regardless of how many there are. Only the yfinance price fetch is
+# expensive, and that now happens per page further down.
 social_badges = load_social_badges(all_tks)
 signals_batch = load_all_signals_batch(all_tks, since_iso)
 # Herd data follows the selected time window so every number on a row describes
@@ -952,8 +978,86 @@ elif sort_mode == "herd":
     )
 
 # ============================================================================
+# FILTER, THEN PAGINATE, THEN FETCH PRICES FOR THE PAGE ONLY
+# ============================================================================
+
+# Market cap lives in the yfinance snapshot, so filtering by it needs caps for
+# every ticker -- not just the current page. That fetch only runs when a cap
+# filter is actually selected, so the default path stays fast.
+cap_map = {}
+if cap_filter:
+    with st.spinner(f"Fetching market caps for {len(all_tks)} tickers..."):
+        cap_map = load_market_caps(all_tks)
+
+filtered_rows = []
+for _r in tz_rows:
+    _tk, _score = _r[0], _r[1]
+    if _score is None:
+        continue
+    if ticker_filter and ticker_filter not in _tk:
+        continue
+    if cap_filter:
+        _, _, _tier_short = get_cap_tier(cap_map.get(_tk))
+        if _tier_short not in cap_filter:
+            continue
+    _on_vol = _tk in uv_tickers
+    if vol_filter == "On volume list" and not _on_vol:
+        continue
+    if vol_filter == "Pre-signal only" and _on_vol:
+        continue
+    filtered_rows.append(_r)
+
+total_rows  = len(filtered_rows)
+total_pages = max(1, math.ceil(total_rows / PAGE_SIZE))
+
+# Clamp -- a filter change can leave the stored page number out of range.
+page_num = min(max(1, st.session_state.get("tz_page", 1)), total_pages)
+st.session_state["tz_page"] = page_num
+
+start_idx = (page_num - 1) * PAGE_SIZE
+page_rows = filtered_rows[start_idx:start_idx + PAGE_SIZE]
+page_tks  = tuple(r[0] for r in page_rows)
+
+if not filtered_rows:
+    st.info("No tickers match the current filters. Widen the time window or "
+            "clear the ticker / market cap / volume filters.")
+    st.stop()
+
+with st.spinner(f"Loading live prices for {len(page_tks)} tickers..."):
+    price_snap = load_price_snapshot(page_tks)
+
+
+def _render_pager(location):
+    """Page controls. Rendered above and below the table; the location string
+    keeps the button keys unique between the two copies."""
+    if total_pages <= 1:
+        return
+    p1, p2, p3 = st.columns([1, 2, 1])
+    with p1:
+        if st.button("< Prev", key=f"tz_prev_{location}",
+                     disabled=page_num <= 1, use_container_width=True):
+            st.session_state["tz_page"] = page_num - 1
+            st.rerun()
+    with p2:
+        first = start_idx + 1
+        last  = min(start_idx + PAGE_SIZE, total_rows)
+        st.markdown(
+            f"<div style='text-align:center;color:#8b949e;font-size:13px;"
+            f"padding-top:6px;'>{first}-{last} of {total_rows} &nbsp;·&nbsp; "
+            f"page {page_num} of {total_pages}</div>",
+            unsafe_allow_html=True,
+        )
+    with p3:
+        if st.button("Next >", key=f"tz_next_{location}",
+                     disabled=page_num >= total_pages, use_container_width=True):
+            st.session_state["tz_page"] = page_num + 1
+            st.rerun()
+
+# ============================================================================
 # COLUMN HEADERS
 # ============================================================================
+
+_render_pager("top")
 
 rs_hdr = (
     '<span style="min-width:54px;text-align:right;color:#6e7681;font-size:12px;">'
@@ -982,30 +1086,16 @@ st.markdown(f"""
 # TICKER ROWS
 # ============================================================================
 
-display_rank = 0
-for tk, score, density, raw_count in tz_rows:
-    if score is None:
-        continue
-
+# Filters were applied before pagination, so this loop just renders. Rank is
+# offset by the page so numbering stays continuous across pages.
+display_rank = start_idx
+for tk, score, density, raw_count in page_rows:
     # Market cap and tier from yfinance snapshot
     pd_snap                      = price_snap.get(tk, {})
-    mc                           = pd_snap.get("market_cap")
+    mc                           = pd_snap.get("market_cap") or cap_map.get(tk)
     tier_key, tier_label, tier_short = get_cap_tier(mc)
 
-    # Apply ticker filter
-    if ticker_filter and ticker_filter not in tk:
-        continue
-
-    # Apply market cap filter if selections were made
-    if cap_filter and tier_short not in cap_filter:
-        continue
-
-    # Apply volume filter
     on_vol_list = tk in uv_tickers
-    if vol_filter == "On volume list" and not on_vol_list:
-        continue
-    if vol_filter == "Pre-signal only" and on_vol_list:
-        continue
 
     display_rank += 1
     rank = display_rank
@@ -1224,9 +1314,13 @@ for tk, score, density, raw_count in tz_rows:
 # FOOTER
 # ============================================================================
 
+_render_pager("bottom")
+
 density_lbl = "weighted" if use_weighted else "raw"
 refresh_lbl = f" · auto-refresh {refresh_secs}s" if _HAS_AUTOREFRESH else ""
+filt_lbl    = (f"{total_rows} of {len(tz_rows)} tickers"
+               if total_rows != len(tz_rows) else f"{total_rows} tickers")
 st.caption(
-    f"{len(tz_rows)} tickers · last {window_label} · "
+    f"{filt_lbl} · last {window_label} · "
     f"{density_lbl} density · ranked by {sort_mode}{refresh_lbl}"
 )
