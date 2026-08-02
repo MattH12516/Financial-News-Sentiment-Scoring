@@ -426,6 +426,17 @@ nav = st.radio(
     label_visibility="collapsed",
     key="main_nav",
 )
+
+# Surface the storage backend. On Railway a fallback to local SQLite is
+# indistinguishable from a working Turso connection until a redeploy wipes
+# everything, so make the difference loud rather than silent.
+if pipeline.db_backend() == "sqlite":
+    st.warning(
+        "Storage: local SQLite. On a deployed instance this is wiped on every "
+        "redeploy -- set TURSO_DATABASE_URL and TURSO_AUTH_TOKEN to persist.",
+        icon=":material/warning:",
+    )
+
 st.divider()
 
 
@@ -1004,7 +1015,43 @@ if nav == "Watchlist":
                     conn.commit()
                     st.rerun()
 
-            with st.expander("signal state when added", expanded=False):
+            with st.expander("set exit levels / signal state when added",
+                             expanded=False):
+                st.markdown("**Exit levels**")
+                st.caption(
+                    "Target and stop drive the coloured dot on this row. Leave "
+                    "either at 0 to clear it -- with neither set the dot just "
+                    "tracks position against the entry price."
+                )
+                e1, e2, e3 = st.columns([1, 1, 1])
+                with e1:
+                    new_target = st.number_input(
+                        "Target price", min_value=0.0, step=0.01,
+                        value=float(target or 0.0), format="%.2f",
+                        key=f"wl_tgt_{wid}")
+                with e2:
+                    new_stop = st.number_input(
+                        "Stop price", min_value=0.0, step=0.01,
+                        value=float(stop or 0.0), format="%.2f",
+                        key=f"wl_stp_{wid}")
+                with e3:
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    if st.button("Save levels", key=f"wl_save_{wid}",
+                                 use_container_width=True):
+                        t_val = new_target if new_target > 0 else None
+                        s_val = new_stop if new_stop > 0 else None
+                        if t_val and entry and t_val <= entry:
+                            st.error("Target should be above the entry price.")
+                        elif s_val and entry and s_val >= entry:
+                            st.error("Stop should be below the entry price.")
+                        else:
+                            conn.execute(
+                                "UPDATE watchlist SET target_price=?, "
+                                "stop_price=? WHERE id=?", (t_val, s_val, wid))
+                            conn.commit()
+                            st.rerun()
+
+                st.divider()
                 if note:
                     st.markdown(f"**Note:** {note}")
                 try:
