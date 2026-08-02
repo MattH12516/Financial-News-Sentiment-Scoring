@@ -119,7 +119,7 @@ st.markdown("""
 
 def get_connection():
     """Return a SQLite connection to the pipeline database."""
-    return sqlite3.connect(pipeline.DB_PATH, check_same_thread=False)
+    return pipeline.get_db_connection()
 
 def fmt_time(iso_str):
     """Absolute Eastern 12-hour timestamp, e.g. '5:07 PM Jul 29'."""
@@ -784,7 +784,7 @@ def _reset_page():
 
 with c1:
     window_label = st.radio(
-        "Time window", ["10 min", "30 min", "1 hour", "4 hours", "24 hours"],
+        "Time window", ["10 min", "30 min", "1 hour", "4 hours", "12 hours", "24 hours"],
         index=2, key="tz_window", on_change=_reset_page,
     )
 with c2:
@@ -918,7 +918,8 @@ st.divider()
 # DATA LOADING
 # ============================================================================
 
-window_map = {"30 min": 30, "1 hour": 60, "4 hours": 240, "24 hours": 1440}
+window_map = {"10 min": 10, "30 min": 30, "1 hour": 60,
+              "4 hours": 240, "12 hours": 720, "24 hours": 1440}
 minutes    = window_map[window_label]
 since_iso  = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat()
 

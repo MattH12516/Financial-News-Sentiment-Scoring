@@ -75,7 +75,7 @@ st.markdown("""
 # ============================================================================
 
 def get_connection():
-    return sqlite3.connect(pipeline.DB_PATH, check_same_thread=False)
+    return pipeline.get_db_connection()
 
 
 def fmt_time(iso_str):

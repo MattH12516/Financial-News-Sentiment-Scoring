@@ -10,3 +10,4 @@ python-dotenv==1.2.1
 langdetect==1.0.9
 curl_cffi==0.13.0
 streamlit-autorefresh==1.0.1
+libsql==0.1.11

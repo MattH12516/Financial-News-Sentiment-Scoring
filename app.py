@@ -138,7 +138,7 @@ def fmt_time(iso_str):
     
 def get_connection():
     """Return a SQLite connection to the pipeline database."""
-    return sqlite3.connect(pipeline.DB_PATH, check_same_thread=False)
+    return pipeline.get_db_connection()
 
 
 def time_ago(iso_str):

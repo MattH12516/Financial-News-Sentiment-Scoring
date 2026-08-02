@@ -67,6 +67,85 @@ except ImportError:
 # ============================================================================
 
 DB_PATH               = "articles.db"
+
+
+class _ReconnectingConnection:
+    """Proxy around a libsql connection that reconnects when Turso drops the
+    stream.
+
+    Turso's Hrana protocol closes idle streams server-side. This pipeline holds
+    one connection open across minutes of feed fetching and LLM scoring, so the
+    stream is often gone by the time the next write lands, surfacing as
+    "stream not found". Rather than restructure the run into short-lived
+    connections, this retries once against a fresh connection.
+
+    Caveat: a reconnect discards any open transaction, so anything written but
+    not yet committed at that moment is lost. The pipeline commits after each
+    logical step, so at most one step's writes are affected -- and the next run
+    re-fetches them anyway.
+    """
+
+    _STREAM_ERRORS = ("stream not found", "stream expired", "stream closed")
+
+    def __init__(self, factory):
+        self._factory = factory
+        self._conn    = factory()
+
+    def _is_stream_error(self, exc):
+        msg = str(exc).lower()
+        return any(m in msg for m in self._STREAM_ERRORS)
+
+    def _retry(self, name, *args, **kwargs):
+        try:
+            return getattr(self._conn, name)(*args, **kwargs)
+        except Exception as exc:
+            if not self._is_stream_error(exc):
+                raise
+            print("   [db] Turso stream dropped -- reconnecting")
+            self._conn = self._factory()
+            return getattr(self._conn, name)(*args, **kwargs)
+
+    def execute(self, *a, **kw):     return self._retry("execute", *a, **kw)
+    def executemany(self, *a, **kw): return self._retry("executemany", *a, **kw)
+    def commit(self, *a, **kw):      return self._retry("commit", *a, **kw)
+    def rollback(self, *a, **kw):    return self._retry("rollback", *a, **kw)
+    def cursor(self, *a, **kw):      return self._retry("cursor", *a, **kw)
+
+    def close(self):
+        try:
+            self._conn.close()
+        except Exception:
+            pass
+
+    def __getattr__(self, item):
+        return getattr(self._conn, item)
+
+
+def get_db_connection():
+    """Return a DB-API connection to the project database.
+
+    Uses Turso (hosted libSQL) when TURSO_DATABASE_URL and TURSO_AUTH_TOKEN are
+    both set, and a local SQLite file otherwise. The fallback means the project
+    runs unchanged with no credentials, so local development and testing work
+    exactly as before.
+
+    Why Turso: Railway's free tier has no persistent volume, so anything written
+    to a local file on the deployed instance is wiped on every redeploy. Turso
+    is external to Railway, so the data survives deploys -- and local pipeline
+    runs and the deployed app share one database instead of being synced by
+    committing a binary file to git.
+
+    libsql-python mirrors the sqlite3 DB-API, so callers do not need to know
+    which backend they got. Queries are identical either way.
+    """
+    url   = os.environ.get("TURSO_DATABASE_URL")
+    token = os.environ.get("TURSO_AUTH_TOKEN")
+    if url and token:
+        import libsql
+        return _ReconnectingConnection(
+            lambda: libsql.connect(database=url, auth_token=token)
+        )
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
 PIPELINE_LOCK         = "pipeline.lock"   # prevents overlapping auto-runs
 TICKERS_PATH          = "company_tickers.json"
 KEYWORDS_PATH         = "financial_keywords.csv"
@@ -398,7 +477,7 @@ def init_db(conn):
         "sentiment_reasoning": "TEXT", "form4_data": "TEXT",
         "keyword_passed": "INTEGER", "wire_source": "TEXT",
     }
-    existing = {row[1] for row in conn.execute("PRAGMA table_info(articles)")}
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(articles)").fetchall()}
     for col, decl in expected.items():
         if col not in existing:
             conn.execute(f"ALTER TABLE articles ADD COLUMN {col} {decl}")
@@ -419,7 +498,7 @@ def init_db(conn):
         "ON ticker_mentions(ticker, mentioned_at)"
     )
 
-    mentions_existing = {row[1] for row in conn.execute("PRAGMA table_info(ticker_mentions)")}
+    mentions_existing = {row[1] for row in conn.execute("PRAGMA table_info(ticker_mentions)").fetchall()}
     for col, decl in {
         "weight": "REAL DEFAULT 1.0",
         "score":  "REAL",
@@ -490,7 +569,7 @@ def init_db(conn):
     )
 
     # Add metadata column to signals if missing from older schema
-    sig_cols = {row[1] for row in conn.execute("PRAGMA table_info(signals)")}
+    sig_cols = {row[1] for row in conn.execute("PRAGMA table_info(signals)").fetchall()}
     if "metadata" not in sig_cols:
         conn.execute("ALTER TABLE signals ADD COLUMN metadata TEXT")
         print("[schema] added missing column to signals: metadata")
@@ -1451,7 +1530,7 @@ def main():
         pass
 
     pipeline_start = time.time()
-    conn           = sqlite3.connect(DB_PATH)
+    conn           = get_db_connection()
     init_db(conn)
     purge_old_articles(conn)
 
