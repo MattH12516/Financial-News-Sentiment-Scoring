@@ -121,6 +121,18 @@ class _ReconnectingConnection:
         return getattr(self._conn, item)
 
 
+def db_backend():
+    """Which database this process will talk to: "turso" or "sqlite".
+
+    Exposed so the UI can display it. A silent fallback to local SQLite on a
+    Railway deploy looks identical to a working Turso connection until a
+    redeploy wipes the data, so the app surfaces this rather than assuming.
+    """
+    if os.environ.get("TURSO_DATABASE_URL") and os.environ.get("TURSO_AUTH_TOKEN"):
+        return "turso"
+    return "sqlite"
+
+
 def get_db_connection():
     """Return a DB-API connection to the project database.
 
