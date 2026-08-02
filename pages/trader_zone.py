@@ -770,11 +770,21 @@ conn = get_connection()
 # ============================================================================
 c1, c2, c3, c4, c5 = st.columns([1, 1, 1, 1, 2])
 
-# Every control carries an explicit key so Streamlit keeps its value in
-# session_state. Without keys the widgets reset to their defaults whenever this
-# page unmounts -- which is what made a trip to Company Deep Dive and back wipe
-# the time window, sort, and filters.
+# Every control carries an explicit key. Keys alone are not enough, though:
+# Streamlit garbage-collects session_state entries for widgets that are not
+# currently rendered, so navigating to Company Deep Dive unmounts this page and
+# drops all of them. Mirroring the values into shadow keys that no widget owns
+# keeps them alive across the round trip -- restored below before the widgets
+# are built, saved again once they exist.
 PAGE_SIZE = 25
+
+_PERSIST_KEYS = ("tz_window", "tz_density", "tz_ticker", "tz_sort", "tz_vol",
+                 "tz_alert", "tz_cap", "tz_refresh_secs", "tz_page")
+
+for _k in _PERSIST_KEYS:
+    _shadow = f"_keep_{_k}"
+    if _shadow in st.session_state and _k not in st.session_state:
+        st.session_state[_k] = st.session_state[_shadow]
 
 
 def _reset_page():
@@ -913,6 +923,12 @@ with b2:
             height=0
         )
 st.divider()
+
+# Widgets exist now, so copy their values into the shadow keys. These survive
+# the page unmount that would otherwise wipe the widget-owned entries.
+for _k in _PERSIST_KEYS:
+    if _k in st.session_state:
+        st.session_state[f"_keep_{_k}"] = st.session_state[_k]
 
 # ============================================================================
 # DATA LOADING
