@@ -408,19 +408,31 @@ conn = get_connection()
 # TABS
 # ============================================================================
 
-tab_feed, tab_chart, tab_social, tab_watch, tab_trader = st.tabs([
-    "News Feed",
-    "Ticker Chart",
-    "Social Feed",
-    "Watchlist",
-    "Trader Zone",
-])
+# st.tabs keeps the selected tab client-side only, so any full script rerun
+# snaps back to the first tab -- which on a cold start (empty caches, every
+# query going over the network to Turso) is long enough that a click lands
+# mid-run and bounces the visitor to News Feed. A radio backed by session_state
+# survives reruns.
+#
+# The second benefit is bigger: st.tabs executes every tab body on every run
+# whether or not it is visible. Rendering conditionally means only the section
+# being looked at does any work.
+NAV_OPTIONS = ["News Feed", "Ticker Chart", "Social Feed", "Watchlist", "Trader Zone"]
+
+nav = st.radio(
+    "Section",
+    NAV_OPTIONS,
+    horizontal=True,
+    label_visibility="collapsed",
+    key="main_nav",
+)
+st.divider()
 
 
 # ============================================================================
 # TAB 1 -- NEWS FEED
 # ============================================================================
-with tab_feed:
+if nav == "News Feed":
     fcol1, fcol2, fcol3, fcol4, fcol5 = st.columns([2, 1, 2, 1, 1])
     with fcol1:
         all_sources = load_sources(conn)
@@ -493,7 +505,7 @@ with tab_feed:
 # ============================================================================
 # TAB 2 -- TICKER CHART
 # ============================================================================
-with tab_chart:
+if nav == "Ticker Chart":
     all_tickers = load_tickers(conn)
     if not all_tickers:
         st.info("No ticker data yet -- run the pipeline a few times first.")
@@ -714,7 +726,7 @@ with tab_chart:
 # ============================================================================
 # TAB 3 -- SOCIAL FEED (HERD RADAR)
 # ============================================================================
-with tab_social:
+if nav == "Social Feed":
     st.markdown("#### Herd Radar -- Where Is Social Attention Right Now")
     st.caption(
         "Tickers ranked by current Stocktwits social activity, drawn from the "
@@ -848,7 +860,7 @@ with tab_social:
 # ============================================================================
 # TAB 4 -- TRADER ZONE LAUNCHER
 # ============================================================================
-with tab_trader:
+if nav == "Trader Zone":
     st.markdown("#### Trader Zone")
     st.caption(
         "Real-time ranked ticker screener with live price, sentiment velocity, "
@@ -862,7 +874,7 @@ with tab_trader:
 # ============================================================================
 # TAB -- WATCHLIST
 # ============================================================================
-with tab_watch:
+if nav == "Watchlist":
     conn.execute("""
         CREATE TABLE IF NOT EXISTS watchlist (
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -890,7 +902,8 @@ with tab_watch:
     )
 
     wl_rows = conn.execute("""
-        SELECT id, ticker, added_at, entry_price, thesis, snapshot_json
+        SELECT id, ticker, added_at, entry_price, thesis, snapshot_json,
+               target_price, stop_price
         FROM   watchlist
         ORDER  BY added_at DESC
     """).fetchall()
@@ -926,7 +939,27 @@ with tab_watch:
         st.caption(f"{len(wl_rows)} on the list")
         st.divider()
 
-        for wid, tk, added_at, entry, note, snap_json in wl_rows:
+        def _wl_status(entry, target, stop, current):
+            """Traffic light for one row -> (dot, label, colour).
+
+            Target and stop are both optional. With neither set the dot just
+            reflects position against the entry price, so a row added without
+            levels still reads sensibly.
+            """
+            if current is None or not entry:
+                return "\u26aa", "no price", "#8b949e"
+            if target and current >= target:
+                return "\U0001f7e2", "target hit", "#3fb950"
+            if stop and current <= stop:
+                return "\U0001f534", "stop hit", "#f85149"
+            if current > entry:
+                return "\U0001f7e2", "above entry", "#3fb950"
+            if current < entry:
+                return "\U0001f534", "below entry", "#f85149"
+            return "\u26aa", "flat", "#8b949e"
+
+        for (wid, tk, added_at, entry, note, snap_json,
+             target, stop) in wl_rows:
             cur = live.get(tk)
             if cur and entry:
                 pct   = (cur - entry) / entry * 100
@@ -936,20 +969,34 @@ with tab_watch:
             else:
                 color, pct_s = "#8b949e", "--"
 
-            c1, c2, c3, c4 = st.columns([1.2, 2.0, 2.0, 0.9])
+            dot, state_lbl, state_col = _wl_status(entry, target, stop, cur)
+
+            c0, c1, c2, c3, c4 = st.columns([0.35, 1.2, 2.2, 2.0, 0.9])
+            with c0:
+                st.markdown(
+                    f"<div style='font-size:20px;padding-top:4px;' "
+                    f"title='{state_lbl}'>{dot}</div>",
+                    unsafe_allow_html=True)
             with c1:
                 st.markdown(
                     f"**{tk}**<br><span style='color:#8b949e;font-size:12px'>"
                     f"{added_at[:10]}</span>", unsafe_allow_html=True)
             with c2:
+                levels = f"entry ${entry:.2f}" if entry else "no entry price"
+                if target:
+                    levels += f" &nbsp;·&nbsp; target ${target:.2f}"
+                if stop:
+                    levels += f" &nbsp;·&nbsp; stop ${stop:.2f}"
                 st.markdown(
-                    f"<span style='font-size:13px;color:#8b949e'>added at "
-                    f"${entry:.2f}</span>", unsafe_allow_html=True)
+                    f"<span style='font-size:13px;color:#8b949e'>{levels}</span>",
+                    unsafe_allow_html=True)
             with c3:
                 cur_s = f"${cur:.2f}" if cur else "--"
                 st.markdown(
                     f"<span style='font-size:13px'>{cur_s}</span> &nbsp;"
-                    f"<span style='color:{color};font-weight:600'>{pct_s}</span>",
+                    f"<span style='color:{color};font-weight:600'>{pct_s}</span>"
+                    f"<br><span style='color:{state_col};font-size:12px'>"
+                    f"{state_lbl}</span>",
                     unsafe_allow_html=True)
             with c4:
                 if st.button("Remove", key=f"wl_del_{wid}"):

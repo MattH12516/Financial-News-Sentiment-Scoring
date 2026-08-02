@@ -1412,9 +1412,13 @@ def process_finviz_signals(conn):
     Empty market cap in Finviz data indicates an ETF or fund, which is skipped.
     Squeeze setup: short float > 10% AND days to cover > 5 simultaneously."""
 
-    # Purge relvol history older than 30 days to keep the table lean
-    cutoff_30d = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
-    conn.execute("DELETE FROM relvol_history WHERE snapshot_at < ?", (cutoff_30d,))
+    # relvol_history keeps exactly one current row per ticker rather than an
+    # append-only log. Finviz recomputes relative volume from the last completed
+    # session, so every run was writing an identical value with a new timestamp
+    # -- the table had grown past 130k rows holding nothing the UI reads. Every
+    # consumer wants the newest reading only, so the whole table is cleared and
+    # rewritten each run.
+    conn.execute("DELETE FROM relvol_history")
 
     rows = fetch_finviz_unusual_volume()
     if not rows:
