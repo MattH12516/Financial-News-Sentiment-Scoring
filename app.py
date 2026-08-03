@@ -970,6 +970,15 @@ if nav == "Watchlist":
 
         live = _wl_prices(tuple(sorted({r[1] for r in wl_rows})))
 
+        # Current six-factor score per ticker, recomputed from live data so it
+        # can be compared against the snapshot frozen at add time.
+        now_scores = {}
+        for _tk in {r[1] for r in wl_rows}:
+            try:
+                now_scores[_tk] = pipeline.current_signal_score(conn, _tk)
+            except Exception:
+                now_scores[_tk] = (None, {})
+
         st.caption(f"{len(wl_rows)} on the list")
         st.divider()
 
@@ -977,6 +986,37 @@ if nav == "Watchlist":
         # it, sub-cent float noise made a stock that had not moved read as
         # "above entry" in green next to +0.00%.
         FLAT_BAND = 0.001   # 0.1%
+
+        # Hard stop on the thesis itself: at most one factor left is no longer a
+        # multi-signal case, and losing two or more from entry means the reason
+        # for the position has materially gone.
+        MIN_SCORE_FLOOR = 2
+        MAX_SCORE_DROP  = 2
+
+        def _exit_state(entry_score, now_score, entry_px, cur_px):
+            """Decide what to do with a position -> (dot, action, colour, detail).
+
+            The exit rule is symmetric with the entry rule: the position was
+            opened because several independent signals agreed, so it closes when
+            they stop agreeing. Price decides whether that exit is a profit or a
+            loss -- it does not decide *when* to exit.
+            """
+            if now_score is None or entry_score is None:
+                return "\u26aa", "no score", "#8b949e", ""
+
+            drop    = entry_score - now_score
+            decayed = now_score < MIN_SCORE_FLOOR or drop >= MAX_SCORE_DROP
+            up      = (cur_px is not None and entry_px and cur_px > entry_px)
+
+            detail = f"{entry_score}/6 at entry, {now_score}/6 now"
+            if not decayed:
+                return ("\U0001f7e2", "hold", "#3fb950",
+                        f"{detail} -- signals intact")
+            if up:
+                return ("\U0001f7e1", "take profit", "#d29922",
+                        f"{detail} -- thesis gone while up")
+            return ("\U0001f534", "cut", "#f85149",
+                    f"{detail} -- thesis gone and below entry")
 
         def _wl_status(entry, target, stop, current):
             """Traffic light for one row -> (dot, label, colour).
@@ -1011,11 +1051,31 @@ if nav == "Watchlist":
 
             dot, state_lbl, state_col = _wl_status(entry, target, stop, cur)
 
+            # Signal-decay verdict. Manual target/stop still take precedence --
+            # if a level was set and hit, that is an explicit instruction.
+            try:
+                _snap_d = json.loads(snap_json or "{}")
+            except Exception:
+                _snap_d = {}
+            entry_score = _snap_d.get("signal_score")
+            if entry_score is None and _snap_d.get("signal_types"):
+                entry_score = len(_snap_d["signal_types"])
+            now_score, now_factors = now_scores.get(tk, (None, {}))
+
+            e_dot, action, a_col, a_detail = _exit_state(
+                entry_score, now_score, entry, cur)
+            if state_lbl in ("target hit", "stop hit"):
+                e_dot, action, a_col = dot, state_lbl, state_col
+                a_detail = "manual level reached"
+
+            lost = [k for k, v in (_snap_d.get("factors") or {}).items()
+                    if v and not now_factors.get(k)]
+
             c0, c1, c2, c3, c4 = st.columns([0.35, 1.2, 2.2, 2.0, 0.9])
             with c0:
                 st.markdown(
                     f"<div style='font-size:20px;padding-top:4px;' "
-                    f"title='{state_lbl}'>{dot}</div>",
+                    f"title='{a_detail or state_lbl}'>{e_dot}</div>",
                     unsafe_allow_html=True)
             with c1:
                 st.markdown(
@@ -1040,9 +1100,15 @@ if nav == "Watchlist":
                 st.markdown(
                     f"<span style='font-size:13px'>{cur_s}</span> &nbsp;"
                     f"<span style='color:{color};font-weight:600'>{pct_s}</span>"
-                    f"<br><span style='color:{state_col};font-size:12px'>"
-                    f"{state_lbl}</span>",
+                    f"<br><span style='color:{a_col};font-weight:600;"
+                    f"font-size:12px'>{action.upper()}</span>"
+                    f"<span style='color:#8b949e;font-size:12px'> &middot; "
+                    f"{a_detail}</span>",
                     unsafe_allow_html=True)
+                if lost:
+                    st.markdown(
+                        f"<span style='color:#8b949e;font-size:11px'>lost: "
+                        f"{', '.join(lost)}</span>", unsafe_allow_html=True)
             with c4:
                 if st.button("Remove", key=f"wl_del_{wid}"):
                     conn.execute("DELETE FROM watchlist WHERE id=?", (wid,))
