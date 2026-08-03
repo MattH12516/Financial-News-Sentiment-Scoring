@@ -936,6 +936,23 @@ _PERSIST_KEYS = ("tz_window", "tz_window_custom", "tz_density", "tz_ticker",
 
 # Restore order: session_state shadows first (fast, same session), then the
 # database (survives the full page load caused by clicking a ticker link).
+# Defaults live here rather than as index=/value= arguments on the widgets.
+# Streamlit warns when a widget has both a literal default and a session_state
+# value set before it is created, which is exactly what restoring filters does.
+# Seeding session_state instead means there is only ever one source of truth.
+_DEFAULTS = {
+    "tz_window":        "1 hour",
+    "tz_density":       "Raw mentions",
+    "tz_ticker":        "",
+    "tz_sort":          "Composite",
+    "tz_vol":           "All",
+    "tz_cap":           [],
+    "tz_refresh_secs":  60,
+    "tz_pipeline_mins": 20,
+    "tz_auto_pipeline": False,
+    "tz_page":          1,
+}
+
 for _k in _PERSIST_KEYS:
     _shadow = f"_keep_{_k}"
     if _shadow in st.session_state and _k not in st.session_state:
@@ -950,6 +967,10 @@ if not any(_k in st.session_state for _k in _PERSIST_KEYS):
     except Exception:
         pass
 
+# Fill anything still unset, so every widget reads its value from session_state.
+for _k, _v in _DEFAULTS.items():
+    st.session_state.setdefault(_k, _v)
+
 
 def _reset_page():
     """Any filter or sort change invalidates the current page number."""
@@ -960,13 +981,16 @@ with c1:
     window_label = st.radio(
         "Time window",
         ["10 min", "30 min", "1 hour", "4 hours", "12 hours", "24 hours", "Custom"],
-        index=2, key="tz_window", on_change=_reset_page,
+        key="tz_window", on_change=_reset_page,
     )
     if window_label == "Custom":
         _today = datetime.now(ZoneInfo("America/New_York")).date()
+        # Seeded rather than passed as value=, for the same reason as the
+        # other controls -- the widget must have exactly one source of truth.
+        st.session_state.setdefault(
+            "tz_window_custom", (_today - timedelta(days=2), _today))
         custom_range = st.date_input(
             "Date range",
-            value=(_today - timedelta(days=2), _today),
             max_value=_today,
             key="tz_window_custom", on_change=_reset_page,
             help="Articles are purged after 7 days, so anything older than that "
@@ -992,7 +1016,6 @@ with c3:
     vol_filter = st.radio(
         "Volume filter",
         ["All", "On volume list", "Pre-signal only"],
-        index=0,
         help=(
             "On volume list = confirmed by Finviz unusual volume. "
             "Pre-signal = signals fired but not yet on volume list."
@@ -1004,7 +1027,6 @@ with c4:
         "Market cap filter",
         ["Mega $200B+", "Large $10B-$200B", "Mid $2B-$10B",
          "Small $300M-$2B", "Micro $50M-$300M", "Nano <$50M"],
-        default=[],
         help="Leave empty to show all. Sizes come from the market cap Finviz "
              "reports, stored by the pipeline.",
         placeholder="All sizes",
@@ -1012,7 +1034,7 @@ with c4:
     )
 with c5:
     refresh_secs = st.select_slider(
-        "Auto-refresh interval", options=[30, 60, 120, 300], value=60,
+        "Auto-refresh interval", options=[30, 60, 120, 300],
         format_func=lambda x: f"{x}s" if x < 60 else f"{x//60}m",
         key="tz_refresh_secs",
     )
@@ -1023,7 +1045,7 @@ with c5:
              "Never starts a run while another is still going."
     )
     pipeline_mins = st.select_slider(
-        "Pipeline interval", options=[15, 20, 30, 45, 60], value=20,
+        "Pipeline interval", options=[15, 20, 30, 45, 60],
         format_func=lambda x: f"{x} min",
         key="tz_pipeline_mins",
         help="Stocktwits allows 200 requests/hour and the pipeline uses roughly "
