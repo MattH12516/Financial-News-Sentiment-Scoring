@@ -544,12 +544,23 @@ def init_db(conn):
     # Relative volume history -- snapshots relvol per pipeline run for trend tracking
     conn.execute("""
         CREATE TABLE IF NOT EXISTS relvol_history (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            ticker      TEXT NOT NULL,
-            relvol      REAL,
-            snapshot_at TEXT NOT NULL
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker       TEXT NOT NULL,
+            relvol       REAL,
+            market_cap_m REAL,
+            snapshot_at  TEXT NOT NULL
         )
     """)
+    # market_cap_m added later -- Finviz already returns market cap and the
+    # pipeline parses it to pick a tier threshold, but used to discard it. The
+    # dashboard then had to ask yfinance for the cap of every ticker just to
+    # filter by size, which was a burst of hundreds of requests and a large part
+    # of what got Yahoo to rate limit.
+    _rv_cols = {row[1] for row in
+                conn.execute("PRAGMA table_info(relvol_history)").fetchall()}
+    if "market_cap_m" not in _rv_cols:
+        conn.execute("ALTER TABLE relvol_history ADD COLUMN market_cap_m REAL")
+        print("[schema] added missing column to relvol_history: market_cap_m")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_relvol_ticker_time "
         "ON relvol_history(ticker, snapshot_at)"
@@ -693,19 +704,10 @@ def purge_old_articles(conn, days=7):
     deleted = conn.execute(
         "DELETE FROM articles WHERE ingested_at < ?", (cutoff,)
     ).rowcount
-    # Mentions must go with their article. Without this the orphans accumulate
-    # forever, and since the score query reads ticker_mentions alone while the
-    # article list joins to articles, they surface as tickers with a sentiment
-    # score and no articles behind it.
-    orphans = conn.execute(
-        "DELETE FROM ticker_mentions "
-        "WHERE article_id NOT IN (SELECT id FROM articles)"
-    ).rowcount
     conn.commit()
     if deleted:
         print(f"[purge] removed {deleted} articles older than {days} days")
-    if orphans:
-        print(f"[purge] removed {orphans} orphaned ticker mentions")
+
 
 # ============================================================================
 # LANE 3 -- FILTERING AND TICKER MATCHING
@@ -1490,8 +1492,9 @@ def process_finviz_signals(conn):
         # any ticker and spot names with signals firing that have not yet moved.
         if rv:
             conn.execute(
-                "INSERT INTO relvol_history (ticker, relvol, snapshot_at) VALUES (?,?,?)",
-                (ticker, rv, now)
+                "INSERT INTO relvol_history "
+                "(ticker, relvol, market_cap_m, snapshot_at) VALUES (?,?,?,?)",
+                (ticker, rv, mc_m, now)
             )
 
         # Only write an unusual_volume signal if it clears its cap tier threshold

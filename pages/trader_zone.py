@@ -305,12 +305,57 @@ def load_ticker_articles(conn, ticker, since_iso, until_iso=None):
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
-def _fetch_one_snapshot(tk):
-    """Fetch a single ticker's price snapshot. Returns (ticker, data_or_None)."""
+def _fetch_prev_close(tk):
+    """Previous session's close for one ticker, from the daily history.
+
+    fast_info.previous_close has been observed returning values matching no
+    recent session -- it once reported +13.98% on a day that was actually
+    +7.40%. The daily bars are reliable.
+    """
     try:
-        fi  = yf.Ticker(tk).fast_info
-        px  = fi.last_price
-        prv = fi.previous_close
+        closes = yf.Ticker(tk).history(period="5d", interval="1d")["Close"].dropna()
+        if len(closes) >= 2:
+            return tk, float(closes.iloc[-2])
+    except Exception:
+        pass
+    return tk, None
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def load_prev_closes(ticker_tuple):
+    """Previous closes for a batch of tickers, cached 6 hours.
+
+    The previous session's close does not change during a trading day, so
+    refetching it alongside every live price was doubling the yfinance calls for
+    no benefit -- and repeated bursts are what gets the endpoint to rate limit,
+    which shows up as blank Price and Day chg columns while the database-backed
+    RelVol keeps working.
+    """
+    out = {}
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {executor.submit(_fetch_prev_close, tk): tk for tk in ticker_tuple}
+        for future in as_completed(futures):
+            tk, val = future.result()
+            if val:
+                out[tk] = val
+    return out
+
+
+def _fetch_one_snapshot(tk, prev_close=None):
+    """Fetch a single ticker's live price. Returns (ticker, data_or_None).
+
+    Only one yfinance call per ticker -- the previous close is passed in from
+    the long-cached batch above.
+    """
+    try:
+        fi = yf.Ticker(tk).fast_info
+        px = fi.last_price
+        prv = prev_close
+        if not prv:
+            try:
+                prv = fi.previous_close
+            except Exception:
+                prv = None
         if px and prv:
             return tk, {
                 "price":      round(px, 2),
@@ -324,34 +369,79 @@ def _fetch_one_snapshot(tk):
     return tk, None
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=600, show_spinner=False)
 def load_price_snapshot(ticker_tuple):
-    """Fetch live price, change, volume, and market cap for a batch of tickers
-    concurrently. Capped at 100 tickers to avoid yfinance rate limiting.
-    Cached 5 minutes. Only successful fetches are cached -- a transient yfinance
-    failure on one run won't get frozen into the cache for the full TTL."""
+    """Live price, change, volume and market cap for a batch of tickers.
+
+    Only the visible page is fetched (25 tickers), and previous closes come from
+    a separate 6-hour cache, so this is one yfinance call per ticker. Worker
+    count is deliberately low: 20 parallel connections is what triggers Yahoo's
+    rate limiting, which surfaces as blank Price and Day chg columns.
+
+    Only successful fetches are cached, so a transient failure on one run is not
+    frozen in for the whole TTL.
+    """
+    prev_closes = load_prev_closes(ticker_tuple)
     result = {}
-    with ThreadPoolExecutor(max_workers=20) as executor:
-        futures = [executor.submit(_fetch_one_snapshot, tk) for tk in ticker_tuple]
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = [executor.submit(_fetch_one_snapshot, tk, prev_closes.get(tk))
+                   for tk in ticker_tuple]
         for future in as_completed(futures):
             tk, data = future.result()
             if data:
                 result[tk] = data
+
+    # A wholesale failure means throttling rather than bad tickers -- say so
+    # instead of rendering a table full of blanks with no explanation.
+    if ticker_tuple and not result:
+        st.warning(
+            "Yahoo Finance is not returning prices right now, most likely rate "
+            "limiting. RelVol, sentiment and herd columns are unaffected -- they "
+            "come from the database. Prices usually recover within a few minutes.",
+            icon=":material/warning:",
+        )
     return result
 
-@st.cache_data(ttl=21600, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
 def load_market_caps(ticker_tuple):
-    """Market cap only, for every ticker -- needed to filter by cap tier before
-    paginating. Cached 6 hours because market cap barely moves intraday, so the
-    cost is paid once rather than on every rerun. Only called when a cap filter
-    is actually selected."""
+    """Market cap per ticker, for filtering by cap tier before pagination.
+
+    Read from relvol_history, which the pipeline now populates with the market
+    cap Finviz already returns. This used to hit yfinance once per ticker --
+    unavoidable at the time, because filtering by size has to happen before the
+    page can be sliced, so pagination could not limit it. Hundreds of requests
+    per filter change was a significant contributor to Yahoo rate limiting.
+
+    Tickers Finviz does not cover fall back to yfinance, which is normally a
+    small handful rather than the whole list.
+    """
     result = {}
-    with ThreadPoolExecutor(max_workers=6) as executor:
-        futures = {executor.submit(_fetch_one_cap, tk): tk for tk in ticker_tuple}
-        for future in as_completed(futures):
-            tk, mc = future.result()
-            if mc:
-                result[tk] = mc
+    try:
+        conn = get_connection()
+        ph   = ",".join("?" for _ in ticker_tuple)
+        rows = conn.execute(f"""
+            SELECT s.ticker, s.market_cap_m
+            FROM   relvol_history s
+            JOIN  (SELECT ticker, MAX(id) AS mid
+                   FROM   relvol_history
+                   WHERE  ticker IN ({ph})
+                   GROUP  BY ticker) m
+              ON   m.ticker = s.ticker AND m.mid = s.id
+        """, ticker_tuple).fetchall()
+        for tk, mc_m in rows:
+            if mc_m:
+                result[tk] = mc_m * 1e6      # stored in millions
+    except Exception:
+        pass
+
+    missing = [tk for tk in ticker_tuple if tk not in result]
+    if missing:
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = {executor.submit(_fetch_one_cap, tk): tk for tk in missing}
+            for future in as_completed(futures):
+                tk, mc = future.result()
+                if mc:
+                    result[tk] = mc
     return result
 
 
@@ -915,8 +1005,8 @@ with c4:
         ["Mega $200B+", "Large $10B-$200B", "Mid $2B-$10B",
          "Small $300M-$2B", "Micro $50M-$300M", "Nano <$50M"],
         default=[],
-        help="Leave empty to show all. Selecting a size fetches market caps for "
-             "every ticker, which makes the first load after a change slower.",
+        help="Leave empty to show all. Sizes come from the market cap Finviz "
+             "reports, stored by the pipeline.",
         placeholder="All sizes",
         key="tz_cap", on_change=_reset_page,
     )
@@ -1131,8 +1221,7 @@ elif sort_mode == "herd":
 # filter is actually selected, so the default path stays fast.
 cap_map = {}
 if cap_filter:
-    with st.spinner(f"Fetching market caps for {len(all_tks)} tickers..."):
-        cap_map = load_market_caps(all_tks)
+    cap_map = load_market_caps(all_tks)
 
 filtered_rows = []
 for _r in tz_rows:
