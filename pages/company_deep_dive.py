@@ -158,21 +158,53 @@ TIER_THRESHOLDS = {
 }
 
 
+@st.cache_data(ttl=21600, show_spinner=False)
+def load_prev_close(ticker):
+    """Previous session's close, from the daily bars.
+
+    Separate and long-cached because it does not change during a trading day.
+    fast_info.previous_close is unreliable -- it returns None or 0 for thin
+    tickers, and has been observed returning a value matching no recent session.
+    """
+    try:
+        closes = yf.Ticker(ticker).history(
+            period="5d", interval="1d")["Close"].dropna()
+        if len(closes) >= 2:
+            return float(closes.iloc[-2])
+    except Exception:
+        pass
+    return None
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def load_snapshot(ticker):
-    """Live price, change, volume, and market cap."""
+    """Live price, change, volume, and market cap.
+
+    The price is returned even when no previous close can be found -- the old
+    version required both, so a thin ticker with a perfectly good last price
+    rendered as "No live price available" simply because the baseline for the
+    percentage was missing.
+    """
     try:
-        fi  = yf.Ticker(ticker).fast_info
-        px  = fi.last_price
-        prv = fi.previous_close
-        if px and prv:
-            return {
-                "price":      round(px, 2),
-                "chg_pct":    100 * (px - prv) / prv,
-                "volume":     getattr(fi, "last_volume", None),
-                "avg_vol":    getattr(fi, "three_month_average_volume", None),
-                "market_cap": getattr(fi, "market_cap", None),
-            }
+        fi = yf.Ticker(ticker).fast_info
+        px = fi.last_price
+        if not px:
+            return {}
+
+        prv = load_prev_close(ticker)
+        if not prv:
+            try:
+                prv = fi.previous_close
+            except Exception:
+                prv = None
+
+        return {
+            "price":      round(px, 2),
+            "chg_pct":    (100 * (px - prv) / prv) if prv else None,
+            "volume":     getattr(fi, "last_volume", None),
+            "avg_vol":    getattr(fi, "three_month_average_volume", None),
+            "market_cap": getattr(fi, "market_cap", None),
+        }
     except Exception:
         pass
     return {}
@@ -405,12 +437,19 @@ with h1:
     )
 with h2:
     if snap:
-        chg     = snap["chg_pct"]
-        chg_cls = ("tk-chg-pos" if chg > 0 else
-                   "tk-chg-neg" if chg < 0 else "tk-chg-neu")
+        # chg_pct is None when no previous close could be found. The price is
+        # still real, so show it and say the change is unavailable rather than
+        # discarding the whole snapshot.
+        chg = snap.get("chg_pct")
+        if chg is None:
+            chg_cls, chg_txt = "tk-chg-neu", "change unavailable"
+        else:
+            chg_cls = ("tk-chg-pos" if chg > 0 else
+                       "tk-chg-neg" if chg < 0 else "tk-chg-neu")
+            chg_txt = f"{chg:+.2f}% today"
         st.markdown(
             f'<div class="tk-price">${snap["price"]:.2f}</div>'
-            f'<div class="{chg_cls}">{chg:+.2f}% today</div>',
+            f'<div class="{chg_cls}">{chg_txt}</div>',
             unsafe_allow_html=True
         )
     else:

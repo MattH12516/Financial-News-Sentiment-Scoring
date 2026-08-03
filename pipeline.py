@@ -704,9 +704,19 @@ def purge_old_articles(conn, days=7):
     deleted = conn.execute(
         "DELETE FROM articles WHERE ingested_at < ?", (cutoff,)
     ).rowcount
+    # Mentions must go with their article. Without this the orphans accumulate
+    # forever, and since the score query reads ticker_mentions alone while the
+    # article list joins to articles, they surface as tickers with a sentiment
+    # score and no articles behind it.
+    orphans = conn.execute(
+        "DELETE FROM ticker_mentions "
+        "WHERE article_id NOT IN (SELECT id FROM articles)"
+    ).rowcount
     conn.commit()
     if deleted:
         print(f"[purge] removed {deleted} articles older than {days} days")
+    if orphans:
+        print(f"[purge] removed {orphans} orphaned ticker mentions")
 
 
 # ============================================================================
