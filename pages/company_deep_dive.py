@@ -523,8 +523,13 @@ _open_pick = conn.execute(
 ).fetchone()
 
 if _open_pick:
+    # entry_price can be NULL: a ticker added while yfinance was unavailable
+    # (rate limiting, or a name it does not cover) has no reference price.
+    # Formatting None with :.2f raises, which took the whole page down.
+    _ep = _open_pick[1]
+    _ep_str = f"at \\${_ep:.2f} entry" if _ep else "with no reference price"
     st.caption(f"{ticker} is already on the watchlist -- added "
-               f"{_open_pick[0][:10]} at ${_open_pick[1]:.2f} entry.")
+               f"{_open_pick[0][:10]} {_ep_str}.")
 
 with st.expander(f"Add {ticker} to watchlist", expanded=False):
     _live = snap.get("price") if snap else None
@@ -613,8 +618,8 @@ with st.expander(f"Add {ticker} to watchlist", expanded=False):
               _live, _live, _t_val, _s_val,
               _note.strip() or None, json.dumps(_snapshot)))
         conn.commit()
-        st.success(f"{ticker} added at ${_live:.2f}." if _live
-                   else f"{ticker} added.")
+        st.success(f"{ticker} added at \\${_live:.2f}." if _live
+                   else f"{ticker} added (no live price available to record).")
         st.rerun()
 # ============================================================================
 # CHART
