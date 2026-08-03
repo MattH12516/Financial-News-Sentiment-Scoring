@@ -122,8 +122,21 @@ def scale_marker_sizes(counts, min_size=6, max_size=22):
     scaled = min_size + (counts - counts.min()) / (counts.max() - counts.min()) * (max_size - min_size)
     return scaled.tolist()
 
-def fmt_time(iso_str):
-    """Absolute Eastern 12-hour timestamp, e.g. '5:07 PM Jul 29'."""
+def fmt_time(iso_str, fallback=None):
+    """Absolute Eastern 12-hour timestamp, e.g. '5:07 PM Jul 29'.
+
+    fallback is used when the primary value is missing or not parseable as ISO.
+    Some feeds return RFC-822 dates, which are non-empty but unparseable, so a
+    plain `a or b` check is not enough to catch them.
+    """
+    for candidate in (iso_str, fallback):
+        out = _fmt_one(candidate)
+        if out:
+            return out
+    return ""
+
+
+def _fmt_one(iso_str):
     if not iso_str:
         return ""
     try:
@@ -214,7 +227,13 @@ def load_articles(conn, sources, ticker, keyword, only_matched, sort_order, limi
         # ingested_at put every article from a single pipeline run at the same
         # sort key, so SQLite fell back to insertion order and that run's
         # articles rendered oldest-first while older days looked correct.
-        query += (" ORDER BY COALESCE(NULLIF(a.published,''), a.ingested_at) DESC,"
+        # published is only trusted when it looks like an ISO timestamp. Some
+        # feeds (FDA's RSS) return RFC-822 dates like "Fri, 01 Aug 2026 ...",
+        # which are non-empty so COALESCE accepted them -- and because text
+        # sorting puts letters above digits, every one of those articles pinned
+        # itself to the top of the feed regardless of age.
+        query += (" ORDER BY CASE WHEN a.published GLOB '[0-9][0-9][0-9][0-9]-*'"
+                  "          THEN a.published ELSE a.ingested_at END DESC,"
                   " a.id DESC")
 
     query += " LIMIT ?"
@@ -485,7 +504,7 @@ if nav == "News Feed":
             )
             st.markdown(f"""
                 <div class="article-row">
-                    <span class="article-time">{fmt_time(row['published'] or row['ingested_at'])}</span>
+                    <span class="article-time">{fmt_time(row['published'], row['ingested_at'])}</span>
                     <span class="article-source">{row['source']}</span>
                     {tickers_html}
                     <a class="article-title" href="{row['link']}" target="_blank">{row['title']}</a>
