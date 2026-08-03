@@ -25,7 +25,8 @@ import math
 import sys
 import time
 import subprocess
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, time as dt_time
+from zoneinfo import ZoneInfo
 
 import json
 import streamlit as st
@@ -234,7 +235,8 @@ def load_latest_relvol(ticker_tuple):
         pass
     return result
 
-def load_trader_zone(conn, since_iso, use_weighted, sort_mode="composite"):
+def load_trader_zone(conn, since_iso, use_weighted, sort_mode="composite",
+                     until_iso=None):
     """Query ranked ticker data from the database.
 
     sort_mode options:
@@ -248,13 +250,16 @@ def load_trader_zone(conn, since_iso, use_weighted, sort_mode="composite"):
         "SUM(COALESCE(tm.weight, 1.0))" if use_weighted
         else "CAST(COUNT(*) AS REAL)"
     )
+    # until_iso is only set when a custom date range ends before today.
+    upper  = " AND tm.mentioned_at <= ?" if until_iso else ""
+    params = (since_iso, until_iso) if until_iso else (since_iso,)
     rows = conn.execute(f"""
         SELECT tm.ticker, AVG(tm.score) AS score,
                {density_expr} AS density, COUNT(*) AS raw_count
         FROM   ticker_mentions tm
-        WHERE  tm.mentioned_at >= ? AND tm.score IS NOT NULL
+        WHERE  tm.mentioned_at >= ?{upper} AND tm.score IS NOT NULL
         GROUP  BY tm.ticker
-    """, (since_iso,)).fetchall()
+    """, params).fetchall()
 
     # Sorting happens in the caller for composite mode (needs herd data);
     # simple modes sort here.
@@ -282,16 +287,19 @@ def load_velocity(conn, ticker, since_iso, window_minutes):
     return recent - early
 
 
-def load_ticker_articles(conn, ticker, since_iso):
+def load_ticker_articles(conn, ticker, since_iso, until_iso=None):
     """Return the 8 most recent articles mentioning a ticker within the time window."""
-    return conn.execute("""
+    upper  = " AND tm.mentioned_at <= ?" if until_iso else ""
+    params = ((ticker, since_iso, until_iso) if until_iso
+              else (ticker, since_iso))
+    return conn.execute(f"""
         SELECT a.title, a.link, a.source,
                COALESCE(NULLIF(a.published, ''), a.ingested_at), tm.score, tm.reasoning
         FROM   ticker_mentions tm
         JOIN   articles a ON a.id = tm.article_id
-        WHERE  tm.ticker=? AND tm.mentioned_at>=?
+        WHERE  tm.ticker=? AND tm.mentioned_at>=?{upper}
         ORDER  BY tm.mentioned_at DESC LIMIT 8
-    """, (ticker, since_iso)).fetchall()
+    """, params).fetchall()
 
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -416,20 +424,23 @@ def load_social_badges(ticker_tuple):
 
 
 @st.cache_data(ttl=120, show_spinner=False)
-def load_all_signals_batch(ticker_tuple, since_iso):
+def load_all_signals_batch(ticker_tuple, since_iso, until_iso=None):
     """Fetch all signals for a batch of tickers in a single query."""
     result = {}
     try:
         conn = get_connection()
         ph   = ",".join("?" for _ in ticker_tuple)
+        upper  = " AND detected_at <= ?" if until_iso else ""
+        params = ((*ticker_tuple, since_iso, until_iso) if until_iso
+                  else (*ticker_tuple, since_iso))
         rows = conn.execute(f"""
             SELECT ticker, signal_type, signal_value,
                    bullish_pct, keyword_hits, detected_at, metadata
             FROM   signals
             WHERE  ticker IN ({ph})
-              AND  detected_at >= ?
+              AND  detected_at >= ?{upper}
             ORDER  BY detected_at DESC
-        """, (*ticker_tuple, since_iso)).fetchall()
+        """, params).fetchall()
         for ticker, stype, sval, bull, kw, at, meta in rows:
             result.setdefault(ticker, []).append({
                 "type":        stype,
@@ -444,7 +455,16 @@ def load_all_signals_batch(ticker_tuple, since_iso):
     return result
 
 
-def compute_signal_score(tk, news_score, signals_list, herd=None):
+# Same thresholds the pipeline uses in _cap_tier, mirrored here so the UI can
+# explain *why* a ticker missed rather than just saying it is not on the list.
+CAP_RELVOL_MIN = {
+    "mega": 1.3, "large": 1.5, "mid": 2.0,
+    "small": 3.0, "micro": 5.0, "nano": 10.0, "unknown": 3.0,
+}
+
+
+def compute_signal_score(tk, news_score, signals_list, herd=None,
+                         relvol=None, tier_key=None):
     """Evaluate six independent signal factors for a ticker.
     Returns (points, flags) where points is 0-6 and flags is a list of
     (icon, description) tuples for display in the drill-down.
@@ -517,7 +537,19 @@ def compute_signal_score(tk, news_score, signals_list, herd=None):
         points += 1
         flags.append(("✅", f"Unusual volume {rv_str}{squeeze_tag}"))
     else:
-        flags.append(("❌", "Not on Finviz unusual volume list"))
+        # The old label read "Not on Finviz unusual volume list", which was
+        # wrong: the pipeline records relvol for every ticker Finviz returns and
+        # only withholds the signal when relvol misses that ticker's market-cap
+        # threshold. A nano cap at 6.0x is on the list and below the 10x bar --
+        # saying so is more useful than a bare no.
+        _thr = CAP_RELVOL_MIN.get(tier_key or "unknown")
+        if relvol and _thr:
+            flags.append(("❌", f"Volume {relvol:.1f}x -- below the {_thr:g}x "
+                                f"threshold for this cap tier"))
+        elif relvol:
+            flags.append(("❌", f"Volume {relvol:.1f}x -- below threshold"))
+        else:
+            flags.append(("❌", "No relative volume reading for this ticker"))
 
     # Factor 5: Multiple large SEC Form 4 purchases filed within 24 hours
     if any(s["type"] == "form4_cluster" for s in signals_list):
@@ -765,6 +797,32 @@ st.markdown("## Trader Zone")
 
 conn = get_connection()
 
+
+# Small key/value store for state that must outlive a browser session. The
+# ticker links in the table are plain anchors, so clicking one is a full browser
+# navigation that destroys the Streamlit session and everything in
+# session_state. Filters therefore live here, not only in session_state.
+def _meta_get(conn, key, default=None):
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS meta "
+                     "(key TEXT PRIMARY KEY, value TEXT)")
+        row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return row[0] if row else default
+    except Exception:
+        return default
+
+
+def _meta_set(conn, key, value):
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS meta "
+                     "(key TEXT PRIMARY KEY, value TEXT)")
+        conn.execute("INSERT INTO meta (key, value) VALUES (?,?) "
+                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                     (key, str(value)))
+        conn.commit()
+    except Exception:
+        pass
+
 # ============================================================================
 # CONTROLS
 # ============================================================================
@@ -786,10 +844,21 @@ _PERSIST_KEYS = ("tz_window", "tz_window_custom", "tz_density", "tz_ticker",
                  "tz_sort", "tz_vol", "tz_cap", "tz_refresh_secs",
                  "tz_auto_pipeline", "tz_pipeline_mins", "tz_page")
 
+# Restore order: session_state shadows first (fast, same session), then the
+# database (survives the full page load caused by clicking a ticker link).
 for _k in _PERSIST_KEYS:
     _shadow = f"_keep_{_k}"
     if _shadow in st.session_state and _k not in st.session_state:
         st.session_state[_k] = st.session_state[_shadow]
+
+if not any(_k in st.session_state for _k in _PERSIST_KEYS):
+    try:
+        _saved = json.loads(_meta_get(conn, "tz_filters", "{}") or "{}")
+        for _k, _v in _saved.items():
+            if _k in _PERSIST_KEYS and _v is not None:
+                st.session_state[_k] = _v
+    except Exception:
+        pass
 
 
 def _reset_page():
@@ -804,10 +873,14 @@ with c1:
         index=2, key="tz_window", on_change=_reset_page,
     )
     if window_label == "Custom":
-        custom_hours = st.number_input(
-            "Hours back", min_value=0.25, max_value=168.0, value=6.0, step=0.25,
+        _today = datetime.now(ZoneInfo("America/New_York")).date()
+        custom_range = st.date_input(
+            "Date range",
+            value=(_today - timedelta(days=2), _today),
+            max_value=_today,
             key="tz_window_custom", on_change=_reset_page,
-            help="Articles are purged after 7 days, so 168 hours is the ceiling.",
+            help="Articles are purged after 7 days, so anything older than that "
+                 "returns nothing.",
         )
 with c2:
     use_weighted = st.radio(
@@ -887,33 +960,6 @@ def _pipeline_is_running(project_dir):
     return True
 
 
-# The last-run timestamp lives in the database rather than st.session_state.
-# session_state is per browser session, so it was forgotten whenever the socket
-# dropped or the app redeployed -- meaning auto-run either fired again
-# immediately or never fired at all. In the database it survives both, and two
-# open tabs cannot each start their own run.
-def _meta_get(conn, key, default=None):
-    try:
-        conn.execute("CREATE TABLE IF NOT EXISTS meta "
-                     "(key TEXT PRIMARY KEY, value TEXT)")
-        row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
-        return row[0] if row else default
-    except Exception:
-        return default
-
-
-def _meta_set(conn, key, value):
-    try:
-        conn.execute("CREATE TABLE IF NOT EXISTS meta "
-                     "(key TEXT PRIMARY KEY, value TEXT)")
-        conn.execute("INSERT INTO meta (key, value) VALUES (?,?) "
-                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                     (key, str(value)))
-        conn.commit()
-    except Exception:
-        pass
-
-
 if _HAS_AUTOREFRESH:
     count = _st_autorefresh(interval=refresh_secs * 1000, key="tz_refresh")
     if auto_pipeline:
@@ -970,11 +1016,20 @@ with b2:
         )
 st.divider()
 
-# Widgets exist now, so copy their values into the shadow keys. These survive
-# the page unmount that would otherwise wipe the widget-owned entries.
+# Widgets exist now, so copy their values into the shadow keys (survives a page
+# unmount within the same session) and into the database (survives the session
+# being destroyed entirely by a ticker link's full page navigation).
 for _k in _PERSIST_KEYS:
     if _k in st.session_state:
         st.session_state[f"_keep_{_k}"] = st.session_state[_k]
+
+try:
+    _meta_set(conn, "tz_filters", json.dumps(
+        {_k: st.session_state[_k] for _k in _PERSIST_KEYS
+         if _k in st.session_state}
+    ))
+except Exception:
+    pass
 
 # ============================================================================
 # DATA LOADING
@@ -982,15 +1037,37 @@ for _k in _PERSIST_KEYS:
 
 window_map = {"10 min": 10, "30 min": 30, "1 hour": 60,
               "4 hours": 240, "12 hours": 720, "24 hours": 1440}
+
+# until_iso stays None for the preset windows and for any custom range ending
+# today -- those are "since X, up to now", which is what every other part of the
+# page assumes.
+until_iso   = None
+custom_days = False
+
 if window_label == "Custom":
-    minutes      = int(custom_hours * 60)
-    window_label = (f"{custom_hours:g} hours" if custom_hours >= 1
-                    else f"{minutes} min")
+    _tz  = ZoneInfo("America/New_York")
+    _now = datetime.now(_tz)
+    if isinstance(custom_range, (list, tuple)) and len(custom_range) == 2:
+        _start, _end = custom_range
+    else:
+        _start = _end = (custom_range if not isinstance(custom_range, (list, tuple))
+                         else custom_range[0])
+
+    _start_dt = datetime.combine(_start, dt_time.min, tzinfo=_tz)
+    _end_dt   = datetime.combine(_end,   dt_time.max, tzinfo=_tz)
+    since_dt  = _start_dt.astimezone(timezone.utc)
+    if _end < _now.date():
+        until_iso = _end_dt.astimezone(timezone.utc).isoformat()
+    minutes      = max(1, int((_now - _start_dt).total_seconds() // 60))
+    window_label = (f"{_start:%b %d}" if _start == _end
+                    else f"{_start:%b %d} to {_end:%b %d}")
+    custom_days  = True
 else:
     minutes = window_map[window_label]
-since_iso  = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat()
+since_iso  = (since_dt.isoformat() if custom_days else
+              (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat())
 
-tz_rows = load_trader_zone(conn, since_iso, use_weighted, sort_mode)
+tz_rows = load_trader_zone(conn, since_iso, use_weighted, sort_mode, until_iso)
 
 if not tz_rows:
     st.info(
@@ -1017,7 +1094,7 @@ uv_tickers = {r[0] for r in conn.execute("""
 # ticker regardless of how many there are. Only the yfinance price fetch is
 # expensive, and that now happens per page further down.
 social_badges = load_social_badges(all_tks)
-signals_batch = load_all_signals_batch(all_tks, since_iso)
+signals_batch = load_all_signals_batch(all_tks, since_iso, until_iso)
 # Herd data follows the selected time window so every number on a row describes
 # the same period. Floored at 1h because pipeline runs are the real resolution
 # limit -- a 10-minute herd window would usually be empty.
@@ -1125,6 +1202,13 @@ def _render_pager(location):
 # COLUMN HEADERS
 # ============================================================================
 
+if until_iso:
+    st.caption(
+        "Historical range: sentiment, density and signals are bounded by the "
+        "dates above. Price, day change, RelVol and herd columns are fetched "
+        "live and always show current values."
+    )
+
 _render_pager("top")
 
 rs_hdr = (
@@ -1196,13 +1280,10 @@ for tk, score, density, raw_count in page_rows:
 
     # Six-factor signal score
     sig_list       = signals_batch.get(tk, [])
-    sig_pts, flags = compute_signal_score(tk, score, sig_list, herd_data.get(tk, {}))
-    sig_cls        = "sig-high" if sig_pts >= 4 else "sig-med" if sig_pts >= 2 else "sig-low"
-    sig_badge      = f'<span class="{sig_cls}">{sig_pts}/6</span>'
-
-
-    # Relative volume -- prefer stored Finviz value (now covers every ticker
-    # Finviz returns, not just threshold-clearing ones), fall back to a live
+    # relvol is resolved here rather than further down because the signal
+    # breakdown below needs it to explain a missed volume threshold.
+    # Prefer the stored Finviz value (which now covers every ticker Finviz
+    # returns, not just threshold-clearing ones), falling back to a live
     # calculation from the yfinance snapshot.
     finviz_rv = relvol_map.get(tk)
     live_rv   = None
@@ -1212,6 +1293,14 @@ for tk, score, density, raw_count in page_rows:
     # came from -- a yfinance-derived figure will not correspond to the Finviz
     # unusual volume list, which is why a high "~" value may not appear there.
     relvol_val = finviz_rv if finviz_rv else live_rv
+
+    sig_pts, flags = compute_signal_score(
+        tk, score, sig_list, herd_data.get(tk, {}),
+        relvol=relvol_val, tier_key=tier_key)
+    sig_cls        = "sig-high" if sig_pts >= 4 else "sig-med" if sig_pts >= 2 else "sig-low"
+    sig_badge      = f'<span class="{sig_cls}">{sig_pts}/6</span>'
+
+
     if relvol_val:
         is_finviz = finviz_rv is not None
         rv_color  = ("#3fb950" if relvol_val >= 3 else
@@ -1276,7 +1365,7 @@ for tk, score, density, raw_count in page_rows:
     """, unsafe_allow_html=True)
 
     # ── Drill-down expander ────────────────────────────────────────────────────
-    articles = load_ticker_articles(conn, tk, since_iso)
+    articles = load_ticker_articles(conn, tk, since_iso, until_iso)
     with st.expander(f"  {tk} -- fundamentals + articles"):
 
         # Signal stage, relvol trend, and plain-English reason

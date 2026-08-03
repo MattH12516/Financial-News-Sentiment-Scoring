@@ -12,7 +12,7 @@ Trader Zone.
 import os
 import sqlite3
 import math
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, time as dt_time
 from zoneinfo import ZoneInfo
 
 import json
@@ -287,16 +287,19 @@ def load_social_series(conn, ticker, since_iso):
     return df
 
 
-def load_articles(conn, ticker, since_iso, limit=25):
-    return conn.execute("""
+def load_articles(conn, ticker, since_iso, limit=25, until_iso=None):
+    upper  = " AND tm.mentioned_at <= ?" if until_iso else ""
+    params = ((ticker, since_iso, until_iso, limit) if until_iso
+              else (ticker, since_iso, limit))
+    return conn.execute(f"""
         SELECT a.title, a.link, a.source,
                COALESCE(NULLIF(a.published, ''), a.ingested_at) AS ts,
                tm.score, tm.reasoning
         FROM   ticker_mentions tm
         JOIN   articles a ON a.id = tm.article_id
-        WHERE  tm.ticker = ? AND tm.mentioned_at >= ?
+        WHERE  tm.ticker = ? AND tm.mentioned_at >= ?{upper}
         ORDER  BY ts DESC LIMIT ?
-    """, (ticker, since_iso, limit)).fetchall()
+    """, params).fetchall()
 
 
 def load_herd(conn, ticker, hours=24):
@@ -630,26 +633,50 @@ tf_map = {
 timeframe = st.radio("Timeframe", list(tf_map.keys()) + ["Custom"],
                      index=3, horizontal=True)
 
+# until_iso stays None unless a custom range ends before today. The preset
+# windows are all "since X, up to now".
+until_iso = None
+
 if timeframe == "Custom":
-    custom_hours = st.number_input(
-        "Hours back", min_value=0.25, max_value=2160.0, value=72.0, step=1.0,
+    _et    = ZoneInfo("America/New_York")
+    _now   = datetime.now(_et)
+    _today = _now.date()
+    custom_range = st.date_input(
+        "Date range",
+        value=(_today - timedelta(days=3), _today),
+        max_value=_today,
         help="Price history goes back as far as you like. News and sentiment "
              "stop at 7 days, since articles are purged after that.",
     )
-    _mins = int(custom_hours * 60)
-    # Pick a bar interval yfinance will actually serve for the span requested.
+    if isinstance(custom_range, (list, tuple)) and len(custom_range) == 2:
+        _start, _end = custom_range
+    else:
+        _start = _end = (custom_range[0]
+                         if isinstance(custom_range, (list, tuple))
+                         else custom_range)
+
+    _start_dt = datetime.combine(_start, dt_time.min, tzinfo=_et)
+    _end_dt   = datetime.combine(_end,   dt_time.max, tzinfo=_et)
+    since_dt  = _start_dt.astimezone(timezone.utc)
+    if _end < _today:
+        until_iso = _end_dt.astimezone(timezone.utc).isoformat()
+
+    # Span from the range start to now -- yfinance periods are relative to the
+    # present, so a closed historical range still needs enough history pulled to
+    # cover it, and the chart is trimmed to the range afterwards.
+    _mins = max(1, int((_now - _start_dt).total_seconds() // 60))
     if   _mins <= 1440:   _period, _interval = "1d",  "1m"
     elif _mins <= 10080:  _period, _interval = "5d",  "30m"
     elif _mins <= 43200:  _period, _interval = "1mo", "1h"
     else:                 _period, _interval = "3mo", "1d"
     tf = {"minutes": _mins, "period": _period, "interval": _interval}
-    timeframe_lbl = (f"{custom_hours:g} hours" if custom_hours < 48
-                     else f"{custom_hours/24:.0f} days")
+    timeframe_lbl = (f"{_start:%b %d}" if _start == _end
+                     else f"{_start:%b %d} to {_end:%b %d}")
 else:
     tf            = tf_map[timeframe]
     timeframe_lbl = timeframe
+    since_dt      = datetime.now(timezone.utc) - timedelta(minutes=tf["minutes"])
 
-since_dt  = datetime.now(timezone.utc) - timedelta(minutes=tf["minutes"])
 since_iso = since_dt.isoformat()
 
 # Articles are purged after 7 days, so a wider chart window cannot surface more
@@ -660,8 +687,16 @@ ARTICLE_RETENTION_MIN = 7 * 24 * 60
 news_mins = min(tf["minutes"], ARTICLE_RETENTION_MIN)
 news_lbl  = (timeframe_lbl if tf["minutes"] <= ARTICLE_RETENTION_MIN
              else "7 days")
-news_since_iso = (datetime.now(timezone.utc)
-                  - timedelta(minutes=news_mins)).isoformat()
+if until_iso:
+    # Custom range: keep the range start unless it reaches past retention.
+    _news_start = max(
+        since_dt,
+        datetime.now(timezone.utc) - timedelta(minutes=ARTICLE_RETENTION_MIN),
+    )
+    news_since_iso = _news_start.isoformat()
+else:
+    news_since_iso = (datetime.now(timezone.utc)
+                      - timedelta(minutes=news_mins)).isoformat()
 
 # Short windows are meaningless outside market hours -- say so rather than
 # letting an empty chart look like a bug.
@@ -677,6 +712,18 @@ if tf["minutes"] <= 60 and not _market_open:
 sentiment_df = load_sentiment_series(conn, ticker, since_iso)
 density_df   = load_density_series(conn, ticker, since_iso)
 social_df    = load_social_series(conn, ticker, since_iso)
+
+# For a custom range ending in the past, trim the series to the end date. The
+# queries only take a lower bound; the hour column is naive UTC, so the cutoff
+# is converted to match before comparing.
+if until_iso:
+    _cut = pd.to_datetime(until_iso).tz_convert("UTC").tz_localize(None)
+    if not sentiment_df.empty:
+        sentiment_df = sentiment_df[sentiment_df["hour"] <= _cut]
+    if not density_df.empty:
+        density_df = density_df[density_df["hour"] <= _cut]
+    if not social_df.empty:
+        social_df = social_df[social_df["hour"] <= _cut]
 price_df     = load_price(ticker, tf["period"], tf["interval"])
 
 has_sent   = not sentiment_df.empty
@@ -797,7 +844,7 @@ if tf["minutes"] > ARTICLE_RETENTION_MIN:
     st.caption("The chart above covers a longer span, but articles are only "
                "kept for 7 days.")
 
-articles = load_articles(conn, ticker, news_since_iso)
+articles = load_articles(conn, ticker, news_since_iso, until_iso=until_iso)
 if not articles:
     st.caption(
         f"No articles for {ticker} in this window. Try a wider timeframe, or "
