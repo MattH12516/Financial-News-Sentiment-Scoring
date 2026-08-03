@@ -778,8 +778,13 @@ c1, c2, c3, c4, c5 = st.columns([1, 1, 1, 1, 2])
 # are built, saved again once they exist.
 PAGE_SIZE = 25
 
-_PERSIST_KEYS = ("tz_window", "tz_density", "tz_ticker", "tz_sort", "tz_vol",
-                 "tz_alert", "tz_cap", "tz_refresh_secs", "tz_page")
+# Rows scoring at or above this are highlighted. Was a slider, but it only ever
+# sat at 0.6 and the control implied a tunable that nothing else depends on.
+ALERT_THRESHOLD = 0.6
+
+_PERSIST_KEYS = ("tz_window", "tz_window_custom", "tz_density", "tz_ticker",
+                 "tz_sort", "tz_vol", "tz_cap", "tz_refresh_secs",
+                 "tz_auto_pipeline", "tz_pipeline_mins", "tz_page")
 
 for _k in _PERSIST_KEYS:
     _shadow = f"_keep_{_k}"
@@ -794,9 +799,16 @@ def _reset_page():
 
 with c1:
     window_label = st.radio(
-        "Time window", ["10 min", "30 min", "1 hour", "4 hours", "12 hours", "24 hours"],
+        "Time window",
+        ["10 min", "30 min", "1 hour", "4 hours", "12 hours", "24 hours", "Custom"],
         index=2, key="tz_window", on_change=_reset_page,
     )
+    if window_label == "Custom":
+        custom_hours = st.number_input(
+            "Hours back", min_value=0.25, max_value=168.0, value=6.0, step=0.25,
+            key="tz_window_custom", on_change=_reset_page,
+            help="Articles are purged after 7 days, so 168 hours is the ceiling.",
+        )
 with c2:
     use_weighted = st.radio(
         "Density mode", ["Raw mentions", "Weighted"],
@@ -825,11 +837,6 @@ with c3:
         key="tz_vol", on_change=_reset_page,
     )
 with c4:
-    alert_threshold = st.slider(
-        "Alert threshold", 0.0, 1.0, 0.6, 0.05,
-        help="Rows with score >= this are highlighted green",
-        key="tz_alert",
-    )
     cap_filter = st.multiselect(
         "Market cap filter",
         ["Mega $200B+", "Large $10B-$200B", "Mid $2B-$10B",
@@ -848,17 +855,22 @@ with c5:
     )
     auto_pipeline = st.toggle(
         "Auto-run pipeline",
-        help="Runs the pipeline at most once every 10 minutes, and never while "
-             "another run is still in progress."
+        key="tz_auto_pipeline",
+        help="Runs the pipeline on the interval below while this page is open. "
+             "Never starts a run while another is still going."
+    )
+    pipeline_mins = st.select_slider(
+        "Pipeline interval", options=[15, 20, 30, 45, 60], value=20,
+        format_func=lambda x: f"{x} min",
+        key="tz_pipeline_mins",
+        help="Stocktwits allows 200 requests/hour and the pipeline uses roughly "
+             "one per ticker, so intervals under 15 minutes risk rate limiting.",
     )
 
 
 # ============================================================================
 # AUTO-REFRESH
 # ============================================================================
-
-AUTO_PIPELINE_MIN_INTERVAL = 600  # 10 minutes
-
 
 def _pipeline_is_running(project_dir):
     """True if a pipeline run is in progress, based on its lock file.
@@ -875,20 +887,54 @@ def _pipeline_is_running(project_dir):
     return True
 
 
+# The last-run timestamp lives in the database rather than st.session_state.
+# session_state is per browser session, so it was forgotten whenever the socket
+# dropped or the app redeployed -- meaning auto-run either fired again
+# immediately or never fired at all. In the database it survives both, and two
+# open tabs cannot each start their own run.
+def _meta_get(conn, key, default=None):
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS meta "
+                     "(key TEXT PRIMARY KEY, value TEXT)")
+        row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return row[0] if row else default
+    except Exception:
+        return default
+
+
+def _meta_set(conn, key, value):
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS meta "
+                     "(key TEXT PRIMARY KEY, value TEXT)")
+        conn.execute("INSERT INTO meta (key, value) VALUES (?,?) "
+                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                     (key, str(value)))
+        conn.commit()
+    except Exception:
+        pass
+
+
 if _HAS_AUTOREFRESH:
     count = _st_autorefresh(interval=refresh_secs * 1000, key="tz_refresh")
-    if auto_pipeline and count > 0:
+    if auto_pipeline:
         _proj     = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        last_run  = st.session_state.get("tz_last_pipeline_ts", 0)
-        elapsed   = time.time() - last_run
+        _interval = pipeline_mins * 60
+        try:
+            last_run = float(_meta_get(conn, "last_pipeline_ts", 0) or 0)
+        except (TypeError, ValueError):
+            last_run = 0.0
+        elapsed = time.time() - last_run
+
         if _pipeline_is_running(_proj):
-            st.caption("Auto-run: a pipeline run is already in progress -- skipping.")
-        elif elapsed < AUTO_PIPELINE_MIN_INTERVAL:
-            wait = int((AUTO_PIPELINE_MIN_INTERVAL - elapsed) / 60) + 1
-            st.caption(f"Auto-run: next eligible run in ~{wait} min "
-                       "(limited to once every 10 minutes).")
+            st.caption("Auto-run: a run is in progress.")
+        elif elapsed < _interval:
+            wait = max(1, int((_interval - elapsed) // 60) + 1)
+            st.caption(f"Auto-run on -- next run in ~{wait} min "
+                       f"(every {pipeline_mins} min).")
         else:
-            st.session_state["tz_last_pipeline_ts"] = time.time()
+            # Claim the slot before launching, so a second rerun landing in the
+            # same instant cannot start a duplicate run.
+            _meta_set(conn, "last_pipeline_ts", time.time())
             subprocess.Popen([sys.executable, "pipeline.py"], cwd=_proj)
             st.cache_data.clear()
             st.caption("Auto-run: pipeline started.")
@@ -936,7 +982,12 @@ for _k in _PERSIST_KEYS:
 
 window_map = {"10 min": 10, "30 min": 30, "1 hour": 60,
               "4 hours": 240, "12 hours": 720, "24 hours": 1440}
-minutes    = window_map[window_label]
+if window_label == "Custom":
+    minutes      = int(custom_hours * 60)
+    window_label = (f"{custom_hours:g} hours" if custom_hours >= 1
+                    else f"{minutes} min")
+else:
+    minutes = window_map[window_label]
 since_iso  = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat()
 
 tz_rows = load_trader_zone(conn, since_iso, use_weighted, sort_mode)
@@ -1141,7 +1192,7 @@ for tk, score, density, raw_count in page_rows:
             vol_html = '<span class="tz-vol-flag" title="Unusual volume">🔥</span>'
 
     # Alert threshold highlighting
-    row_cls = "tz-alert-row" if score >= alert_threshold else "tz-row"
+    row_cls = "tz-alert-row" if score >= ALERT_THRESHOLD else "tz-row"
 
     # Six-factor signal score
     sig_list       = signals_batch.get(tk, [])

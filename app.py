@@ -210,7 +210,12 @@ def load_articles(conn, sources, ticker, keyword, only_matched, sort_order, limi
         query += (" ORDER BY CASE WHEN a.sentiment_score IS NULL THEN 1 ELSE 0 END,"
                   " a.sentiment_score ASC")
     else:
-        query += " ORDER BY a.ingested_at DESC"
+        # Sort by publish time, which is what the feed displays. Sorting by
+        # ingested_at put every article from a single pipeline run at the same
+        # sort key, so SQLite fell back to insertion order and that run's
+        # articles rendered oldest-first while older days looked correct.
+        query += (" ORDER BY COALESCE(NULLIF(a.published,''), a.ingested_at) DESC,"
+                  " a.id DESC")
 
     query += " LIMIT ?"
     params.append(limit)
@@ -534,15 +539,14 @@ if nav == "Ticker Chart":
                 if not in_db:
                     st.caption("Price only -- no sentiment history for this ticker yet.")
             else:
-                search   = st.text_input("Filter DB tickers", placeholder="search...")
-                filtered = (
-                    [t for t in all_tickers if search.strip().upper() in t.upper()]
-                    if search.strip() else all_tickers
-                )
+                # The old "Filter DB tickers" text box duplicated the selectbox,
+                # which already supports type-to-search, and duplicated the
+                # free-text box above it. Removed.
                 chart_ticker = st.selectbox(
                     "Select ticker",
-                    filtered if filtered else all_tickers,
-                    key="chart_ticker"
+                    all_tickers,
+                    key="chart_ticker",
+                    help="Type to search. Or use the box above for any ticker."
                 )
                 in_db = True
 
@@ -950,6 +954,11 @@ if nav == "Watchlist":
         st.caption(f"{len(wl_rows)} on the list")
         st.divider()
 
+        # A position within this fraction of entry counts as unchanged. Without
+        # it, sub-cent float noise made a stock that had not moved read as
+        # "above entry" in green next to +0.00%.
+        FLAT_BAND = 0.001   # 0.1%
+
         def _wl_status(entry, target, stop, current):
             """Traffic light for one row -> (dot, label, colour).
 
@@ -963,19 +972,20 @@ if nav == "Watchlist":
                 return "\U0001f7e2", "target hit", "#3fb950"
             if stop and current <= stop:
                 return "\U0001f534", "stop hit", "#f85149"
-            if current > entry:
+            drift = (current - entry) / entry
+            if drift > FLAT_BAND:
                 return "\U0001f7e2", "above entry", "#3fb950"
-            if current < entry:
+            if drift < -FLAT_BAND:
                 return "\U0001f534", "below entry", "#f85149"
-            return "\u26aa", "flat", "#8b949e"
+            return "\u26aa", "unchanged", "#8b949e"
 
         for (wid, tk, added_at, entry, note, snap_json,
              target, stop) in wl_rows:
             cur = live.get(tk)
             if cur and entry:
                 pct   = (cur - entry) / entry * 100
-                color = ("#3fb950" if pct > 0 else
-                         "#f85149" if pct < 0 else "#8b949e")
+                color = ("#3fb950" if pct >  FLAT_BAND * 100 else
+                         "#f85149" if pct < -FLAT_BAND * 100 else "#8b949e")
                 pct_s = f"{pct:+.2f}%"
             else:
                 color, pct_s = "#8b949e", "--"
@@ -993,16 +1003,21 @@ if nav == "Watchlist":
                     f"**{tk}**<br><span style='color:#8b949e;font-size:12px'>"
                     f"{added_at[:10]}</span>", unsafe_allow_html=True)
             with c2:
-                levels = f"entry ${entry:.2f}" if entry else "no entry price"
+                # Dollar signs must be escaped. Streamlit's markdown reads a
+                # pair of unescaped $ as inline LaTeX, so "entry $16.35 ·
+                # target $17.99" rendered the middle as maths -- and the raw
+                # &nbsp; entities leaked through as literal text.
+                levels = (f"entry \\${entry:.2f}" if entry
+                          else "no entry price")
                 if target:
-                    levels += f" &nbsp;·&nbsp; target ${target:.2f}"
+                    levels += f" &middot; target \\${target:.2f}"
                 if stop:
-                    levels += f" &nbsp;·&nbsp; stop ${stop:.2f}"
+                    levels += f" &middot; stop \\${stop:.2f}"
                 st.markdown(
                     f"<span style='font-size:13px;color:#8b949e'>{levels}</span>",
                     unsafe_allow_html=True)
             with c3:
-                cur_s = f"${cur:.2f}" if cur else "--"
+                cur_s = f"\\${cur:.2f}" if cur else "--"
                 st.markdown(
                     f"<span style='font-size:13px'>{cur_s}</span> &nbsp;"
                     f"<span style='color:{color};font-weight:600'>{pct_s}</span>"
@@ -1059,5 +1074,53 @@ if nav == "Watchlist":
                 except Exception:
                     _d = {}
                 if _d:
-                    st.json(_d, expanded=False)
+                    st.markdown("**Signal state when added**")
+
+                    def _fmt(k, v):
+                        if v is None:
+                            return "--"
+                        if isinstance(v, bool):
+                            return "yes" if v else "no"
+                        if isinstance(v, list):
+                            return ", ".join(str(x) for x in v) if v else "--"
+                        if isinstance(v, float):
+                            if k in ("bullish_pct",):
+                                return f"{v:.0%}"
+                            if k == "market_cap":
+                                return f"${v/1e9:.1f}B" if v >= 1e9 else f"${v/1e6:.0f}M"
+                            if k in ("relvol", "relvol_threshold"):
+                                return f"{v:.1f}x"
+                            if k == "chg_pct":
+                                return f"{v:+.2f}%"
+                            if k == "price":
+                                return f"${v:.2f}"
+                            return f"{v:.2f}"
+                        return str(v)
+
+                    LABELS = {
+                        "price": "Price", "chg_pct": "Day change",
+                        "relvol": "Relative volume",
+                        "relvol_threshold": "RelVol threshold",
+                        "cap_tier": "Market cap tier", "market_cap": "Market cap",
+                        "avg_sentiment": "Avg news sentiment",
+                        "mentions_24h": "Mentions (24h)",
+                        "bullish_pct": "Social bullish", "bullish_ct": "Bullish tags",
+                        "bearish_ct": "Bearish tags", "herd_hits": "Herd keyword hits",
+                        "total_posts": "Posts sampled",
+                        "on_volume_list": "On unusual volume list",
+                        "whale_buying": "Whale buying",
+                        "signal_types": "Signals fired",
+                    }
+                    # Rendered as plain rows rather than st.json -- the raw
+                    # collapsed "{...}" blob was unreadable and looked unfinished.
+                    _lines = [
+                        f"<tr><td style='padding:2px 18px 2px 0;color:#8b949e;"
+                        f"font-size:13px'>{LABELS.get(k, k)}</td>"
+                        f"<td style='padding:2px 0;font-size:13px'>{_fmt(k, v)}</td></tr>"
+                        for k, v in _d.items()
+                    ]
+                    st.markdown(
+                        "<table style='border-collapse:collapse'>"
+                        + "".join(_lines) + "</table>",
+                        unsafe_allow_html=True)
             st.divider()

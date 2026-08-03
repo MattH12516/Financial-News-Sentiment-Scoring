@@ -627,17 +627,48 @@ tf_map = {
     "1 week":  {"minutes": 10080, "period": "5d",  "interval": "30m"},
     "1 month": {"minutes": 43200, "period": "1mo", "interval": "1h"},
 }
-timeframe = st.radio("Timeframe", list(tf_map.keys()), index=3, horizontal=True)
-tf        = tf_map[timeframe]
+timeframe = st.radio("Timeframe", list(tf_map.keys()) + ["Custom"],
+                     index=3, horizontal=True)
+
+if timeframe == "Custom":
+    custom_hours = st.number_input(
+        "Hours back", min_value=0.25, max_value=2160.0, value=72.0, step=1.0,
+        help="Price history goes back as far as you like. News and sentiment "
+             "stop at 7 days, since articles are purged after that.",
+    )
+    _mins = int(custom_hours * 60)
+    # Pick a bar interval yfinance will actually serve for the span requested.
+    if   _mins <= 1440:   _period, _interval = "1d",  "1m"
+    elif _mins <= 10080:  _period, _interval = "5d",  "30m"
+    elif _mins <= 43200:  _period, _interval = "1mo", "1h"
+    else:                 _period, _interval = "3mo", "1d"
+    tf = {"minutes": _mins, "period": _period, "interval": _interval}
+    timeframe_lbl = (f"{custom_hours:g} hours" if custom_hours < 48
+                     else f"{custom_hours/24:.0f} days")
+else:
+    tf            = tf_map[timeframe]
+    timeframe_lbl = timeframe
+
 since_dt  = datetime.now(timezone.utc) - timedelta(minutes=tf["minutes"])
 since_iso = since_dt.isoformat()
+
+# Articles are purged after 7 days, so a wider chart window cannot surface more
+# news than that. The news section below is labelled with the effective window
+# rather than the chart's, to avoid promising a month of articles that do not
+# exist.
+ARTICLE_RETENTION_MIN = 7 * 24 * 60
+news_mins = min(tf["minutes"], ARTICLE_RETENTION_MIN)
+news_lbl  = (timeframe_lbl if tf["minutes"] <= ARTICLE_RETENTION_MIN
+             else "7 days")
+news_since_iso = (datetime.now(timezone.utc)
+                  - timedelta(minutes=news_mins)).isoformat()
 
 # Short windows are meaningless outside market hours -- say so rather than
 # letting an empty chart look like a bug.
 _now_et      = datetime.now(timezone.utc).astimezone(EASTERN)
 _mins_now    = _now_et.hour * 60 + _now_et.minute
 _market_open = _now_et.weekday() < 5 and (9 * 60 + 30) <= _mins_now <= (16 * 60)
-if timeframe in ("10 min", "30 min", "1 hour") and not _market_open:
+if tf["minutes"] <= 60 and not _market_open:
     st.caption(
         "Market is currently closed -- short intraday windows will show no new "
         "price data until 9:30 AM ET on the next trading day."
@@ -761,9 +792,12 @@ st.divider()
 # NEWS
 # ============================================================================
 
-st.markdown(f"#### Recent news -- last {timeframe}")
+st.markdown(f"#### Recent news -- last {news_lbl}")
+if tf["minutes"] > ARTICLE_RETENTION_MIN:
+    st.caption("The chart above covers a longer span, but articles are only "
+               "kept for 7 days.")
 
-articles = load_articles(conn, ticker, since_iso)
+articles = load_articles(conn, ticker, news_since_iso)
 if not articles:
     st.caption(
         f"No articles for {ticker} in this window. Try a wider timeframe, or "
