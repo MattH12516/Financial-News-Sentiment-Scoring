@@ -85,7 +85,18 @@ class _ReconnectingConnection:
     re-fetches them anyway.
     """
 
-    _STREAM_ERRORS = ("stream not found", "stream expired", "stream closed")
+    # Anything transient at the connection or stream layer. Turso closes idle
+    # streams server-side, and the HTTP connection itself can drop mid-response
+    # -- that one surfaces as "unexpected EOF during chunk size line" rather
+    # than a stream message, so matching only on "stream" missed it and the
+    # error propagated to the page instead of being retried.
+    _STREAM_ERRORS = (
+        "stream not found", "stream expired", "stream closed",
+        "unexpected eof", "cursor error", "connection reset",
+        "connection closed", "connection aborted", "broken pipe",
+        "error reading a body", "timed out", "timeout",
+        "502", "503", "504",
+    )
 
     def __init__(self, factory):
         self._factory = factory
@@ -96,14 +107,29 @@ class _ReconnectingConnection:
         return any(m in msg for m in self._STREAM_ERRORS)
 
     def _retry(self, name, *args, **kwargs):
-        try:
-            return getattr(self._conn, name)(*args, **kwargs)
-        except Exception as exc:
-            if not self._is_stream_error(exc):
-                raise
-            print("   [db] Turso stream dropped -- reconnecting")
-            self._conn = self._factory()
-            return getattr(self._conn, name)(*args, **kwargs)
+        """Run an operation, reconnecting once on a transient failure.
+
+        Two attempts rather than one: a reconnect immediately after a dropped
+        connection can itself land on a bad socket, and a short pause gives the
+        far side time to settle.
+        """
+        last = None
+        for attempt in range(2):
+            try:
+                return getattr(self._conn, name)(*args, **kwargs)
+            except Exception as exc:
+                if not self._is_stream_error(exc):
+                    raise
+                last = exc
+                print(f"   [db] Turso connection dropped -- reconnecting "
+                      f"(attempt {attempt + 1})")
+                if attempt:
+                    time.sleep(0.5)
+                try:
+                    self._conn = self._factory()
+                except Exception:
+                    pass
+        raise last
 
     def execute(self, *a, **kw):     return self._retry("execute", *a, **kw)
     def executemany(self, *a, **kw): return self._retry("executemany", *a, **kw)
@@ -696,56 +722,6 @@ def save_article(conn, link, title, summary, body, source, published,
                 (tk, article_id, event_at, weights.get(tk, 1.0),
                  tk_info.get("score"), tk_info.get("reasoning"))
             )
-
-
-def current_signal_score(conn, ticker, window_hours=24):
-    """Recompute the six-factor score for one ticker from current data.
-
-    Lives here rather than in trader_zone so the watchlist can use it too --
-    importing a Streamlit page module would execute the page. Mirrors the
-    factors in trader_zone.compute_signal_score.
-
-    Returns (points, factors) where factors maps a readable factor name to
-    True/False, so a caller can report which ones were lost rather than only
-    that the total fell.
-    """
-    since = (datetime.now(timezone.utc) - timedelta(hours=window_hours)).isoformat()
-    factors = {}
-
-    # 1. News sentiment
-    row = conn.execute("""
-        SELECT AVG(score) FROM ticker_mentions
-        WHERE  ticker = ? AND score IS NOT NULL AND mentioned_at >= ?
-    """, (ticker, since)).fetchone()
-    news = row[0] if row else None
-    factors["news sentiment"] = bool(news is not None and news > 0.3)
-
-    # 2/3. Social bullish% and herd keyword activity, from the latest social row
-    row = conn.execute("""
-        SELECT bullish_pct, keyword_hits, bullish_count, bearish_count
-        FROM   signals
-        WHERE  ticker = ? AND signal_type IN ('social_spike','social_read')
-          AND  detected_at >= ?
-        ORDER  BY detected_at DESC LIMIT 1
-    """, (ticker, since)).fetchone()
-    bull_pct  = row[0] if row else None
-    herd_hits = (row[1] or 0) if row else 0
-    factors["social bullish"] = bool(bull_pct is not None and bull_pct >= 0.6)
-    factors["herd activity"]  = bool(herd_hits >= 3)
-
-    # 4/6. Unusual volume and squeeze setup
-    types = {r[0] for r in conn.execute("""
-        SELECT DISTINCT signal_type FROM signals
-        WHERE  ticker = ? AND detected_at >= ?
-    """, (ticker, since)).fetchall()}
-    factors["unusual volume"] = bool(
-        types & {"unusual_volume", "unusual_volume_squeeze"})
-    factors["squeeze setup"]  = bool("unusual_volume_squeeze" in types)
-
-    # 5. Whale buying -- Form 4 cluster
-    factors["whale buying"] = bool("form4_cluster" in types)
-
-    return sum(1 for v in factors.values() if v), factors
 
 
 def purge_old_articles(conn, days=7):
