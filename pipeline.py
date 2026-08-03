@@ -69,6 +69,45 @@ except ImportError:
 DB_PATH               = "articles.db"
 
 
+class _RetryCursor:
+    """Cursor proxy that re-runs its query if reading the result fails.
+
+    The connection wrapper below only sees calls made on the connection --
+    execute, commit and so on. But `conn.execute(sql).fetchall()` reads the
+    response body inside fetchall(), on the cursor, and Turso's
+    "error reading a body from connection: unexpected EOF" happens exactly
+    there. Retrying a fetch alone is meaningless once the stream is gone, so
+    this remembers the statement and replays the whole execute-then-fetch.
+    """
+
+    def __init__(self, owner, cursor, sql, params):
+        self._owner  = owner
+        self._cursor = cursor
+        self._sql    = sql
+        self._params = params
+
+    def _refetch(self, name, *args, **kwargs):
+        try:
+            return getattr(self._cursor, name)(*args, **kwargs)
+        except Exception as exc:
+            if not self._owner._is_stream_error(exc):
+                raise
+            print("   [db] connection dropped mid-read -- replaying query")
+            self._owner._reconnect()
+            self._cursor = self._owner._raw_execute(self._sql, self._params)
+            return getattr(self._cursor, name)(*args, **kwargs)
+
+    def fetchall(self, *a, **k):   return self._refetch("fetchall", *a, **k)
+    def fetchone(self, *a, **k):   return self._refetch("fetchone", *a, **k)
+    def fetchmany(self, *a, **k):  return self._refetch("fetchmany", *a, **k)
+
+    def __iter__(self):
+        return iter(self.fetchall())
+
+    def __getattr__(self, item):
+        return getattr(self._cursor, item)
+
+
 class _ReconnectingConnection:
     """Proxy around a libsql connection that reconnects when Turso drops the
     stream.
@@ -131,7 +170,25 @@ class _ReconnectingConnection:
                     pass
         raise last
 
-    def execute(self, *a, **kw):     return self._retry("execute", *a, **kw)
+    def _reconnect(self):
+        try:
+            self._conn = self._factory()
+        except Exception:
+            pass
+
+    def _raw_execute(self, sql, params):
+        return (self._conn.execute(sql, params) if params is not None
+                else self._conn.execute(sql))
+
+    def execute(self, sql, params=None, *a, **kw):
+        """Run a statement and wrap the cursor so the fetch can be replayed."""
+        if params is not None:
+            cur = self._retry("execute", sql, params, *a, **kw)
+        else:
+            cur = self._retry("execute", sql, *a, **kw)
+        if cur is None or isinstance(cur, _RetryCursor):
+            return cur
+        return _RetryCursor(self, cur, sql, params)
     def executemany(self, *a, **kw): return self._retry("executemany", *a, **kw)
     def commit(self, *a, **kw):      return self._retry("commit", *a, **kw)
     def rollback(self, *a, **kw):    return self._retry("rollback", *a, **kw)
