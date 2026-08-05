@@ -992,6 +992,35 @@ if nav == "Watchlist":
         MIN_SCORE_FLOOR = 2
         MAX_SCORE_DROP  = 2
 
+        def _derive_entry_score(snap):
+            """Rebuild the six-factor score from a snapshot's raw fields.
+
+            Entries added before the score was stored explicitly still froze
+            every input it is computed from -- sentiment, bullish%, herd hits,
+            the volume flag and the signal list. Deriving from those is exact,
+            so old rows get a real baseline instead of "no score" and do not
+            need to be removed and re-added.
+
+            Thresholds mirror pipeline.current_signal_score.
+            """
+            if not snap:
+                return None, {}
+            types = set(snap.get("signal_types") or [])
+            f = {
+                "news sentiment": (snap.get("avg_sentiment") is not None
+                                   and snap["avg_sentiment"] > 0.3),
+                "social bullish": (snap.get("bullish_pct") is not None
+                                   and snap["bullish_pct"] >= 0.6),
+                "herd activity":  (snap.get("herd_hits") or 0) >= 3,
+                "unusual volume": bool(snap.get("on_volume_list")
+                                       or types & {"unusual_volume",
+                                                   "unusual_volume_squeeze"}),
+                "squeeze setup":  "unusual_volume_squeeze" in types,
+                "whale buying":   bool(snap.get("whale_buying")
+                                       or "form4_cluster" in types),
+            }
+            return sum(1 for v in f.values() if v), f
+
         def _exit_state(entry_score, now_score, entry_px, cur_px):
             """Decide what to do with a position -> (dot, action, colour, detail).
 
@@ -1034,15 +1063,20 @@ if nav == "Watchlist":
                 _snap_d = json.loads(snap_json or "{}")
             except Exception:
                 _snap_d = {}
-            entry_score = _snap_d.get("signal_score")
-            if entry_score is None and _snap_d.get("signal_types"):
-                entry_score = len(_snap_d["signal_types"])
+            # Prefer the stored score; fall back to deriving it from the raw
+            # snapshot fields. The old fallback counted signal_types, which
+            # counts database rows rather than factors and gave a wrong
+            # baseline.
+            entry_score   = _snap_d.get("signal_score")
+            entry_factors = _snap_d.get("factors") or {}
+            if entry_score is None:
+                entry_score, entry_factors = _derive_entry_score(_snap_d)
             now_score, now_factors = now_scores.get(tk, (None, {}))
 
             e_dot, action, a_col, a_detail = _exit_state(
                 entry_score, now_score, entry, cur)
 
-            lost = [k for k, v in (_snap_d.get("factors") or {}).items()
+            lost = [k for k, v in entry_factors.items()
                     if v and not now_factors.get(k)]
 
             c0, c1, c2, c3, c4 = st.columns([0.35, 1.2, 2.2, 2.0, 0.9])
