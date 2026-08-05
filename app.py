@@ -936,8 +936,7 @@ if nav == "Watchlist":
     )
 
     wl_rows = conn.execute("""
-        SELECT id, ticker, added_at, entry_price, thesis, snapshot_json,
-               target_price, stop_price
+        SELECT id, ticker, added_at, entry_price, thesis, snapshot_json
         FROM   watchlist
         ORDER  BY added_at DESC
     """).fetchall()
@@ -1018,28 +1017,7 @@ if nav == "Watchlist":
             return ("\U0001f534", "cut", "#f85149",
                     f"{detail} -- thesis gone and below entry")
 
-        def _wl_status(entry, target, stop, current):
-            """Traffic light for one row -> (dot, label, colour).
-
-            Target and stop are both optional. With neither set the dot just
-            reflects position against the entry price, so a row added without
-            levels still reads sensibly.
-            """
-            if current is None or not entry:
-                return "\u26aa", "no price", "#8b949e"
-            if target and current >= target:
-                return "\U0001f7e2", "target hit", "#3fb950"
-            if stop and current <= stop:
-                return "\U0001f534", "stop hit", "#f85149"
-            drift = (current - entry) / entry
-            if drift > FLAT_BAND:
-                return "\U0001f7e2", "above entry", "#3fb950"
-            if drift < -FLAT_BAND:
-                return "\U0001f534", "below entry", "#f85149"
-            return "\u26aa", "unchanged", "#8b949e"
-
-        for (wid, tk, added_at, entry, note, snap_json,
-             target, stop) in wl_rows:
+        for wid, tk, added_at, entry, note, snap_json in wl_rows:
             cur = live.get(tk)
             if cur and entry:
                 pct   = (cur - entry) / entry * 100
@@ -1049,10 +1027,9 @@ if nav == "Watchlist":
             else:
                 color, pct_s = "#8b949e", "--"
 
-            dot, state_lbl, state_col = _wl_status(entry, target, stop, cur)
-
-            # Signal-decay verdict. Manual target/stop still take precedence --
-            # if a level was set and hit, that is an explicit instruction.
+            # Signal-decay verdict. There are no manual price targets: the
+            # position closes when the signals that opened it stop agreeing,
+            # and price only determines whether that exit is a profit or a loss.
             try:
                 _snap_d = json.loads(snap_json or "{}")
             except Exception:
@@ -1064,9 +1041,6 @@ if nav == "Watchlist":
 
             e_dot, action, a_col, a_detail = _exit_state(
                 entry_score, now_score, entry, cur)
-            if state_lbl in ("target hit", "stop hit"):
-                e_dot, action, a_col = dot, state_lbl, state_col
-                a_detail = "manual level reached"
 
             lost = [k for k, v in (_snap_d.get("factors") or {}).items()
                     if v and not now_factors.get(k)]
@@ -1075,23 +1049,17 @@ if nav == "Watchlist":
             with c0:
                 st.markdown(
                     f"<div style='font-size:20px;padding-top:4px;' "
-                    f"title='{a_detail or state_lbl}'>{e_dot}</div>",
+                    f"title='{a_detail or action}'>{e_dot}</div>",
                     unsafe_allow_html=True)
             with c1:
                 st.markdown(
                     f"**{tk}**<br><span style='color:#8b949e;font-size:12px'>"
                     f"{added_at[:10]}</span>", unsafe_allow_html=True)
             with c2:
-                # Dollar signs must be escaped. Streamlit's markdown reads a
-                # pair of unescaped $ as inline LaTeX, so "entry $16.35 ·
-                # target $17.99" rendered the middle as maths -- and the raw
-                # &nbsp; entities leaked through as literal text.
+                # Dollar signs must be escaped -- Streamlit's markdown reads a
+                # pair of unescaped $ as inline LaTeX.
                 levels = (f"entry \\${entry:.2f}" if entry
                           else "no entry price")
-                if target:
-                    levels += f" &middot; target \\${target:.2f}"
-                if stop:
-                    levels += f" &middot; stop \\${stop:.2f}"
                 st.markdown(
                     f"<span style='font-size:13px;color:#8b949e'>{levels}</span>",
                     unsafe_allow_html=True)
@@ -1115,43 +1083,7 @@ if nav == "Watchlist":
                     conn.commit()
                     st.rerun()
 
-            with st.expander("set exit levels / signal state when added",
-                             expanded=False):
-                st.markdown("**Exit levels**")
-                st.caption(
-                    "Target and stop drive the coloured dot on this row. Leave "
-                    "either at 0 to clear it -- with neither set the dot just "
-                    "tracks position against the entry price."
-                )
-                e1, e2, e3 = st.columns([1, 1, 1])
-                with e1:
-                    new_target = st.number_input(
-                        "Target price", min_value=0.0, step=0.01,
-                        value=float(target or 0.0), format="%.2f",
-                        key=f"wl_tgt_{wid}")
-                with e2:
-                    new_stop = st.number_input(
-                        "Stop price", min_value=0.0, step=0.01,
-                        value=float(stop or 0.0), format="%.2f",
-                        key=f"wl_stp_{wid}")
-                with e3:
-                    st.markdown("<br>", unsafe_allow_html=True)
-                    if st.button("Save levels", key=f"wl_save_{wid}",
-                                 use_container_width=True):
-                        t_val = new_target if new_target > 0 else None
-                        s_val = new_stop if new_stop > 0 else None
-                        if t_val and entry and t_val <= entry:
-                            st.error("Target should be above the entry price.")
-                        elif s_val and entry and s_val >= entry:
-                            st.error("Stop should be below the entry price.")
-                        else:
-                            conn.execute(
-                                "UPDATE watchlist SET target_price=?, "
-                                "stop_price=? WHERE id=?", (t_val, s_val, wid))
-                            conn.commit()
-                            st.rerun()
-
-                st.divider()
+            with st.expander("signal state when added", expanded=False):
                 if note:
                     st.markdown(f"**Note:** {note}")
                 try:

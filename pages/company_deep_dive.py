@@ -550,40 +550,13 @@ with st.expander(f"Add {ticker} to watchlist", expanded=False):
         st.caption(f"No live price available for {ticker} right now -- it will "
                    "be recorded without a reference price.")
 
-    # Target and stop drive the coloured dot on the Watchlist tab. Both are
-    # optional -- leave either at 0 and the dot just tracks position against the
-    # entry price. They can also be set or changed later from the Watchlist tab.
-    _t1, _t2 = st.columns(2)
-    with _t1:
-        _target = st.number_input(
-            "Target price (optional)", min_value=0.0, step=0.01,
-            value=float(round((_live or 0.0) * 1.10, 2)) if _live else 0.0,
-            format="%.2f", key="wl_target",
-            help="Dot turns green when the price reaches this. 0 to skip.")
-    with _t2:
-        _stop = st.number_input(
-            "Stop price (optional)", min_value=0.0, step=0.01,
-            value=float(round((_live or 0.0) * 0.95, 2)) if _live else 0.0,
-            format="%.2f", key="wl_stop",
-            help="Dot turns red when the price falls to this. 0 to skip.")
-
+    # No target or stop. The exit rule is signal decay -- the position closes
+    # when the six factors that opened it stop agreeing, which is symmetric with
+    # the entry rule and avoids picking an arbitrary price out of the air.
     _note = st.text_input("Note (optional)",
                           placeholder="Anything worth remembering.")
 
     if st.button("Add to watchlist", type="primary", key="wl_add"):
-        _t_val = _target if _target > 0 else None
-        _s_val = _stop   if _stop   > 0 else None
-
-        # A target below entry or a stop above it would trigger the moment the
-        # row renders, making the indicator meaningless -- reject rather than
-        # silently store.
-        if _t_val and _live and _t_val <= _live:
-            st.error("Target should be above the current price.")
-            st.stop()
-        if _s_val and _live and _s_val >= _live:
-            st.error("Stop should be below the current price.")
-            st.stop()
-
         _since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
         _sent  = conn.execute("""
             SELECT AVG(score), COUNT(*) FROM ticker_mentions
@@ -621,12 +594,11 @@ with st.expander(f"Add {ticker} to watchlist", expanded=False):
 
         conn.execute("""
             INSERT INTO watchlist
-            (ticker, added_at, added_price, entry_price, target_price,
-             stop_price, thesis, snapshot_json, status)
-            VALUES (?,?,?,?,?,?,?,?,'watching')
+            (ticker, added_at, added_price, entry_price, thesis,
+             snapshot_json, status)
+            VALUES (?,?,?,?,?,?,'watching')
         """, (ticker, datetime.now(timezone.utc).isoformat(),
-              _live, _live, _t_val, _s_val,
-              _note.strip() or None, json.dumps(_snapshot)))
+              _live, _live, _note.strip() or None, json.dumps(_snapshot)))
         conn.commit()
         st.success(f"{ticker} added at \\${_live:.2f}." if _live
                    else f"{ticker} added (no live price available to record).")
