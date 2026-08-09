@@ -233,6 +233,7 @@ def load_price(ticker, period, interval):
 
 
 def load_sentiment_series(conn, ticker, since_iso):
+    """Hourly average sentiment score and mention count, for the chart overlay."""
     rows = conn.execute("""
         SELECT strftime('%Y-%m-%dT%H:00:00', tm.mentioned_at) AS hour,
                AVG(tm.score) AS avg_score, COUNT(*) AS mentions
@@ -248,6 +249,7 @@ def load_sentiment_series(conn, ticker, since_iso):
 
 
 def load_density_series(conn, ticker, since_iso):
+    """Hourly mention count only, for the density bars on the chart."""
     rows = conn.execute("""
         SELECT strftime('%Y-%m-%dT%H:00:00', mentioned_at) AS hour,
                COUNT(*) AS mentions
@@ -263,6 +265,7 @@ def load_density_series(conn, ticker, since_iso):
 
 
 def load_social_series(conn, ticker, since_iso):
+    """Hourly Stocktwits bullish% and post counts, for the chart overlay."""
     try:
         rows = conn.execute("""
             SELECT strftime('%Y-%m-%dT%H:00:00', detected_at) AS hour,
@@ -288,6 +291,7 @@ def load_social_series(conn, ticker, since_iso):
 
 
 def load_articles(conn, ticker, since_iso, limit=25, until_iso=None):
+    """Most recent scored articles mentioning this ticker within the window."""
     upper  = " AND tm.mentioned_at <= ?" if until_iso else ""
     params = ((ticker, since_iso, until_iso, limit) if until_iso
               else (ticker, since_iso, limit))
@@ -303,6 +307,11 @@ def load_articles(conn, ticker, since_iso, limit=25, until_iso=None):
 
 
 def load_herd(conn, ticker, hours=24):
+    """Aggregated social reading (bullish%, herd hits) for the stat block at the
+    top of the page. NOTE: sums keyword_hits/post_count across every matching
+    row in the window -- if the pipeline has run more than once in that window,
+    this double counts the same lesson fixed elsewhere (see Herd Radar in
+    app.py). Not yet patched here."""
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
     try:
         row = conn.execute("""
@@ -339,6 +348,7 @@ def load_finviz_relvol(conn, ticker):
 
 
 def load_recent_signals(conn, ticker, hours=48):
+    """Raw signal rows (volume, whale, squeeze, social) for the drill-down list."""
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
     try:
         rows = conn.execute("""

@@ -21,13 +21,13 @@ The dashboard visualizes all of this in real time across four tabs: News Feed, T
 
 ## Key Features
 
-- **Multi-signal scoring (0–6)** per ticker: news sentiment, social bullish%, herd spike, unusual volume, insider cluster, squeeze setup
-- **Composite ranking** using `sentiment × log(1 + density)` — rewards both signal quality and article volume
-- **Pre-signal candidates** — tickers with firing signals not yet confirmed by unusual volume (early-stage watchlist)
-- **Market cap tiered volume thresholds** — large caps flagged at lower relative volume than microcaps
+- **Multi-signal scoring (0-6)** per ticker: news sentiment, social bullish%, herd spike, unusual volume, insider cluster, squeeze setup
+- **Composite ranking** using `sentiment x log(1 + density)` -- rewards both signal quality and article volume
+- **Market cap tiered volume thresholds** -- large caps flagged at lower relative volume than microcaps
 - **Sentiment velocity** arrows showing whether a ticker's news sentiment is improving or declining within the window
-- **Custom date range** on the Ticker Chart for historical sentiment/price overlay analysis
+- **Custom date range** on the Ticker Chart, Trader Zone, and Company Deep Dive, for historical sentiment/price overlay analysis
 - **Social Feed tab** showing Stocktwits bullish/bearish ratio and herd keyword detection per ticker
+- **Watchlist with a signal-decay exit rule** -- flagging a ticker freezes its six-factor score at that moment; the tool later compares the frozen score against the live one and reports HOLD, TAKE PROFIT, or CUT. The exit is symmetric with the entry: a position closes when the signals that justified it stop agreeing, not at a manually chosen price target. See "Exit Strategy" below.
 
 ---
 
@@ -44,15 +44,23 @@ pipeline.py                     # Data pipeline — runs independently
 └── Lane 6: Signal Detection    # Stocktwits stream, Finviz unusual volume, Form 4 clusters
 
 app.py                          # Streamlit dashboard (main entry point)
-├── Tab 1: News Feed            # Filterable article list with AI breakdown
-├── Tab 2: Ticker Chart         # Sentiment + density + social + price overlay
-├── Tab 3: Social Feed          # Live Stocktwits herd sentiment per ticker
-└── Tab 4: Trader Zone          # Link to pop-out screener
+├── News Feed                   # Filterable article list with AI breakdown
+├── Ticker Chart                # Sentiment + density + social + price overlay
+├── Social Feed                 # Live Stocktwits herd sentiment per ticker
+├── Watchlist                   # Tickers flagged from Company Deep Dive, with
+│                                # a signal-decay exit verdict (see below)
+└── Trader Zone                 # Link to the pop-out screener
 
 pages/trader_zone.py            # Standalone Trader Zone page
-├── Ranked ticker list          # Composite/score/density sort with cap filter
-├── Unusual volume section      # Current Finviz unusual volume list
-└── Pre-signal candidates       # Early-stage watchlist
+├── Ranked, paginated ticker list  # Composite/score/density/herd sort,
+│                                  # market cap and volume filters
+└── Auto-run pipeline           # Runs the pipeline on a timer while the
+                                 # page is open, tracked in the database
+                                 # so it survives redeploys and page reloads
+
+pages/company_deep_dive.py      # Per-ticker page: price chart, six-factor
+                                 # signal breakdown, fundamentals, recent
+                                 # articles, and the "Add to watchlist" form
 ```
 
 ---
@@ -74,9 +82,11 @@ pages/trader_zone.py            # Standalone Trader Zone page
 
 ### Prerequisites
 
-- Python 3.9+
-- Finviz Elite account (for unusual volume screener)
-- Anthropic API key (for sentiment scoring)
+- Python 3.11 (curl_cffi and libsql do not publish installable wheels for
+  older or newer Python versions at time of writing; 3.9 and 3.13 have both
+  been confirmed to fail the install)
+- Finviz Elite account (optional -- for the unusual volume screener)
+- Anthropic API key (optional -- for LLM sentiment scoring)
 
 ### Installation
 
@@ -92,14 +102,20 @@ Create a `.env` file in the project root:
 
 ```dotenv
 ANTHROPIC_API_KEY="your-anthropic-api-key"
-FINVIZ_API_KEY="your-finviz-elite-api-key"
-TRADINGVIEW_SESSIONID="your-tradingview-session-id"
-TRADINGVIEW_SESSIONID_SIGN="your-tradingview-session-sign"
+FINVIZ_EMAIL="your-finviz-elite-email"
+FINVIZ_PASSWORD="your-finviz-elite-password"
+
+# Optional -- only needed to run against the hosted Turso database instead of
+# the local articles.db file. See "Database" below.
+TURSO_DATABASE_URL="libsql://your-database.turso.io"
+TURSO_AUTH_TOKEN="your-turso-auth-token"
 ```
 
-**Getting TradingView credentials:** Log into TradingView, open browser dev tools → Application → Cookies → copy `sessionid` and `sessionid_sign` values.
+**Note:** Finviz logs in automatically with the email/password above and pulls a fresh API key each run, since the static key regenerates periodically and cannot be hardcoded.
 
-**Note:** The Finviz Elite API key regenerates periodically. Update it in `.env` when it does.
+**No TradingView credentials are needed.** The news mediator endpoint is queried as an anonymous user (`user_prostatus=non_pro`), so no session cookie is required -- confirmed by running the pipeline with none set and getting the same article count.
+
+**None of these are required to run the app.** Every credential above degrades gracefully when absent: the pipeline skips that data source and logs why, sentiment scoring is skipped if `ANTHROPIC_API_KEY` is missing, and the app runs against a local SQLite file if the Turso variables are not set. A machine with none of these configured can still clone the repo, install dependencies, and run the dashboard against the committed `articles.db`.
 
 ### Running Locally (Development)
 
@@ -124,32 +140,42 @@ To deploy your own instance:
 3. Add the following environment variables in Railway's dashboard under **Variables**:
    ```
    ANTHROPIC_API_KEY=your-key
-   FINVIZ_API_KEY=your-key
-   TRADINGVIEW_SESSIONID=your-session-id
-   TRADINGVIEW_SESSIONID_SIGN=your-session-sign
+   FINVIZ_EMAIL=your-finviz-elite-email
+   FINVIZ_PASSWORD=your-finviz-elite-password
+   TURSO_DATABASE_URL=libsql://your-database.turso.io
+   TURSO_AUTH_TOKEN=your-turso-auth-token
    ```
-4. Add a `Procfile` in the project root containing:
-   ```
-   web: streamlit run app.py --server.port=$PORT --server.address=0.0.0.0
-   ```
-5. Railway will auto-detect Python and deploy
+4. Railway auto-detects the Python app and deploys.
 
-**Note:** Railway's filesystem is ephemeral — the database resets on redeploy. The committed `articles.db` provides a pre-populated starting point. Use the "Run pipeline now" button in the dashboard to fetch fresh data after deployment.
+**Note:** Railway's filesystem is ephemeral -- any data written to a local file resets on every redeploy. Without the Turso variables above, the app falls back to the committed `articles.db`, which resets to that snapshot on each deploy. With them set, both the deployed app and any local `python pipeline.py` runs read and write the same persistent database, so data survives redeploys and local runs stay in sync with what is shown live.
 
 ---
 
 ## Database
 
-The app uses SQLite (`articles.db`) with the following tables:
+The app talks to Turso (hosted libSQL) when `TURSO_DATABASE_URL` and
+`TURSO_AUTH_TOKEN` are set, and to a local SQLite file (`articles.db`)
+otherwise -- `pipeline.get_db_connection()` decides which, and every other
+file calls that function rather than opening a connection directly. The two
+backends use the same schema and the same SQL throughout the app.
+
+Turso exists because Railway's free tier has no persistent disk, so a local
+file on a deployed instance is wiped on every redeploy. Running the pipeline
+locally with the same Turso credentials writes to the same database the
+deployed app reads, rather than syncing two separate files by hand.
 
 | Table | Contents |
 |-------|----------|
 | `articles` | News articles with title, source, body, sentiment score |
 | `ticker_mentions` | Per-ticker sentiment scores and prominence weights per article |
 | `signals` | Social spikes, Form 4 clusters, unusual volume events with timestamps |
-| `relvol_history` | Relative volume snapshots over time for trend tracking |
+| `relvol_history` | One current relative-volume reading per ticker, refreshed each pipeline run |
+| `watchlist` | Tickers flagged from Company Deep Dive, with the six-factor snapshot frozen at the time of adding |
+| `meta` | Small key/value store -- currently holds the auto-run pipeline timer and the last-saved Trader Zone filter state |
 
-The pipeline automatically purges articles older than 7 days and relvol history older than 30 days.
+The pipeline purges articles older than 7 days on every run, and their
+`ticker_mentions` rows along with them -- a mention pointing at a deleted
+article would otherwise show a sentiment score with no article behind it.
 
 ---
 
@@ -233,7 +259,7 @@ The system does not predict stock prices. It identifies when multiple independen
 
 ## Tech Stack
 
-- **Python 3.9**
+- **Python 3.11**
 - **Streamlit** — dashboard framework
 - **SQLite** — local database
 - **Claude Haiku** (Anthropic) — LLM sentiment scoring

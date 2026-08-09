@@ -252,8 +252,6 @@ MAX_WORKERS           = 50    # Concurrent fetch threads for TradingView body fe
 SEC_USER_AGENT = "SentiFeed matthunter0021@gmail.com"
 
 # TradingView session credentials loaded from .env -- not hardcoded
-TRADINGVIEW_SESSIONID      = os.getenv("TRADINGVIEW_SESSIONID", "")
-TRADINGVIEW_SESSIONID_SIGN = os.getenv("TRADINGVIEW_SESSIONID_SIGN", "")
 
 # Browser impersonation settings for sites that block automated requests
 IMPERSONATE = "chrome"
@@ -491,17 +489,15 @@ def _rate_limit(url):
 def fetch_raw(url, sec=False):
     """Fetch a URL with browser impersonation via curl_cffi, falling back to requests.
     SEC endpoints use a descriptive User-Agent as required by EDGAR Fair Access Policy.
-    TradingView endpoints attach session cookies for authenticated content access."""
+
+    TradingView's news mediator endpoint is queried with user_prostatus=non_pro,
+    i.e. as an anonymous user, so no session cookie is attached or required --
+    confirmed by running the pipeline with no TradingView credentials set and
+    getting the same article count as with them."""
     global _curl_disabled
     _rate_limit(url)
 
     extra_headers = {}
-    # Attach TradingView session cookies when fetching TV content
-    if "tradingview.com" in urlparse(url).netloc and TRADINGVIEW_SESSIONID:
-        extra_headers["Cookie"] = (
-            f"sessionid={TRADINGVIEW_SESSIONID}; "
-            f"sessionid_sign={TRADINGVIEW_SESSIONID_SIGN}"
-        )
 
     # curl_cffi impersonates a real browser TLS fingerprint to bypass bot detection
     if _HAS_CURL and not _curl_disabled and not sec:
@@ -835,9 +831,19 @@ def purge_old_articles(conn, days=7):
     deleted = conn.execute(
         "DELETE FROM articles WHERE ingested_at < ?", (cutoff,)
     ).rowcount
+    # Mentions must go with their article. Without this, a ticker can show a
+    # sentiment score in the Trader Zone with no article behind it in the News
+    # Feed -- the score query reads ticker_mentions alone, while the article
+    # list joins to articles.
+    orphans = conn.execute(
+        "DELETE FROM ticker_mentions "
+        "WHERE article_id NOT IN (SELECT id FROM articles)"
+    ).rowcount
     conn.commit()
     if deleted:
         print(f"[purge] removed {deleted} articles older than {days} days")
+    if orphans:
+        print(f"[purge] removed {orphans} orphaned ticker mentions")
 
 
 # ============================================================================
