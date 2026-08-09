@@ -781,6 +781,54 @@ def save_article(conn, link, title, summary, body, source, published,
             )
 
 
+def current_signal_score(conn, ticker, window_hours=24):
+    """Recompute the six-factor score for one ticker from current data.
+
+    Lives here rather than in trader_zone so the watchlist can use it too --
+    importing a Streamlit page module would execute the page. Mirrors the
+    factors in trader_zone.compute_signal_score.
+
+    Returns (points, factors) where factors maps a readable factor name to
+    True/False, so a caller can report which ones were lost rather than only
+    that the total fell.
+    """
+    since = (datetime.now(timezone.utc) - timedelta(hours=window_hours)).isoformat()
+    factors = {}
+
+    # 1. News sentiment
+    row = conn.execute("""
+        SELECT AVG(score) FROM ticker_mentions
+        WHERE  ticker = ? AND score IS NOT NULL AND mentioned_at >= ?
+    """, (ticker, since)).fetchone()
+    news = row[0] if row else None
+    factors["news sentiment"] = bool(news is not None and news > 0.3)
+
+    # 2/3. Social bullish% and herd keyword activity, from the latest social row
+    row = conn.execute("""
+        SELECT bullish_pct, keyword_hits
+        FROM   signals
+        WHERE  ticker = ? AND signal_type IN ('social_spike','social_read')
+          AND  detected_at >= ?
+        ORDER  BY detected_at DESC LIMIT 1
+    """, (ticker, since)).fetchone()
+    bull_pct  = row[0] if row else None
+    herd_hits = (row[1] or 0) if row else 0
+    factors["social bullish"] = bool(bull_pct is not None and bull_pct >= 0.6)
+    factors["herd activity"]  = bool(herd_hits >= 3)
+
+    # 4/5/6. Unusual volume, squeeze setup and whale buying
+    types = {r[0] for r in conn.execute("""
+        SELECT DISTINCT signal_type FROM signals
+        WHERE  ticker = ? AND detected_at >= ?
+    """, (ticker, since)).fetchall()}
+    factors["unusual volume"] = bool(
+        types & {"unusual_volume", "unusual_volume_squeeze"})
+    factors["squeeze setup"]  = bool("unusual_volume_squeeze" in types)
+    factors["whale buying"]   = bool("form4_cluster" in types)
+
+    return sum(1 for v in factors.values() if v), factors
+
+
 def purge_old_articles(conn, days=7):
     """Remove articles older than the retention window to keep the database lean."""
     cutoff  = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
