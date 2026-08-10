@@ -145,15 +145,22 @@ class _ReconnectingConnection:
         msg = str(exc).lower()
         return any(m in msg for m in self._STREAM_ERRORS)
 
-    def _retry(self, name, *args, **kwargs):
-        """Run an operation, reconnecting once on a transient failure.
+    # Sleep before each retry, not the initial attempt -- 1s then 2s. Longer
+    # than the old flat 0.5s because a gateway-level failure (a 502 while the
+    # backend is cold-starting after being idle) can outlast a very short
+    # pause even though it clears within a couple of seconds.
+    _RETRY_BACKOFF = (0, 1, 2)
 
-        Two attempts rather than one: a reconnect immediately after a dropped
-        connection can itself land on a bad socket, and a short pause gives the
-        far side time to settle.
+    def _retry(self, name, *args, **kwargs):
+        """Run an operation, reconnecting on a transient failure.
+
+        Three attempts total: a reconnect immediately after a drop can itself
+        land on another bad socket, so one retry is not always enough.
         """
         last = None
-        for attempt in range(2):
+        for attempt, wait in enumerate(self._RETRY_BACKOFF):
+            if wait:
+                time.sleep(wait)
             try:
                 return getattr(self._conn, name)(*args, **kwargs)
             except Exception as exc:
@@ -162,8 +169,6 @@ class _ReconnectingConnection:
                 last = exc
                 print(f"   [db] Turso connection dropped -- reconnecting "
                       f"(attempt {attempt + 1})")
-                if attempt:
-                    time.sleep(0.5)
                 try:
                     self._conn = self._factory()
                 except Exception:
